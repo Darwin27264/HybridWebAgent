@@ -100,7 +100,7 @@ export interface AgentAction {
   id: string;
   taskId: string;
   timestamp: number;
-  type: 'navigation' | 'extraction' | 'inference' | 'scroll' | 'alert' | 'system';
+  type: 'navigation' | 'extraction' | 'inference' | 'scroll' | 'alert' | 'system' | 'stagnation_detected' | 'system2_handover' | 'interaction';
   status: 'pending' | 'success' | 'warning' | 'error';
   message: string;
   details?: Record<string, any>;
@@ -155,12 +155,56 @@ export interface JobSchedule {
 
 // --- Loop Detection & Steering Contracts ---
 
+export interface InteractiveInputElement {
+  selector: string;
+  tag: string;
+  type?: string;
+  name?: string;
+  placeholder?: string;
+  ariaLabel?: string;
+  formAction?: string;
+  value?: string;
+}
+
+export interface NavigationChoice {
+  selector: string;
+  text: string;
+  href?: string;
+  category?: string;
+}
+
+export type HandoverTriggerReason =
+  | 'stagnation'
+  | 'form_input_required'
+  | 'navigation_fork'
+  | 'stalled_progress';
+
+export type StuckReason = 'bottom_of_page' | 'no_new_items' | 'repeated_actions' | 'selector_empty';
+
 export type SystemTwoSteeringAction =
   | { action: 'paginate'; selector: string; text?: string }
   | { action: 'navigate'; url: string }
   | { action: 'switch_tab'; tabIndex?: number; url?: string }
   | { action: 'adjust_strategy'; newSelector?: string; scrollStepPx?: number }
-  | { action: 'terminate'; reason: 'goal_completed' | 'unachievable' | 'exhausted'; message: string };
+  | { action: 'adjust_selector'; selector: string }
+  | { action: 'retry_with_scroll'; scrollStepPx?: number }
+  | { action: 'complete'; message?: string }
+  | { action: 'terminate'; reason: 'goal_completed' | 'unachievable' | 'exhausted'; message: string }
+  | {
+      action: 'form_input';
+      selector: string;
+      text: string;
+      submitSelector?: string;
+      pressEnter?: boolean;
+      reasoning?: string;
+    }
+  | {
+      action: 'choose_navigation';
+      selector: string;
+      url?: string;
+      text?: string;
+      reasoning?: string;
+    };
 
 export interface HandoverContext {
   taskId: string;
@@ -169,7 +213,8 @@ export interface HandoverContext {
   targetUrl: string;
   currentUrl: string;
   pageTitle: string;
-  stuckReason: 'bottom_of_page' | 'no_new_items' | 'repeated_actions' | 'selector_empty';
+  triggerReason?: HandoverTriggerReason;
+  stuckReason?: StuckReason;
   scrollState: {
     y: number;
     scrollHeight: number;
@@ -178,11 +223,48 @@ export interface HandoverContext {
   totalScanned: number;
   totalAlerts: number;
   consecutiveEmptyCycles: number;
-  interactiveElements: Array<{
+  interactiveElements?: Array<{
     selector: string;
     text: string;
     href?: string;
     tag: string;
+  }>;
+  formInputs?: InteractiveInputElement[];
+  navigationChoices?: NavigationChoice[];
+  recentActions?: string[];
+}
+
+export interface TaskCheckpoint {
+  id: string;
+  taskId: string;
+  runId: string;
+  createdAt: number;
+  updatedAt: number;
+  status: 'running' | 'paused' | 'stopped' | 'completed' | 'interrupted';
+  targetUrl: string;
+  currentUrl: string;
+  pageTitle?: string;
+  scroll: {
+    y: number;
+    scrollHeight: number;
+    viewportHeight: number;
+  };
+  totalScanned: number;
+  totalAlerts: number;
+  activeStepCount: number;
+  dedupHashes: string[];
+  modelConfig?: {
+    systemOneModel?: string;
+    systemTwoModel?: string;
+  };
+  wizardState?: {
+    currentPage?: number;
+    userGoal?: string;
+  };
+  chatContext?: Array<{
+    role: 'user' | 'assistant' | 'system';
+    text: string;
+    timestamp: number;
   }>;
 }
 
@@ -230,10 +312,29 @@ export interface ResultStats {
   topCategories: Record<string, number>;
 }
 
+export interface GgufModelInfo {
+  id: string;
+  name: string;
+  tag: string;
+  description: string;
+  sizeMb: number;
+  downloaded: boolean;
+  active: boolean;
+  isDownloading?: boolean;
+  downloadProgress?: {
+    percent: number;
+    downloadedMb: number;
+    totalMb: number;
+    speedMbps: number;
+  };
+}
+
 export type WsClientToServerMessage =
   | { type: 'COMPILE_TASK'; payload: { userGoal: string; ollamaModel?: string } }
   | { type: 'START_TASK'; payload: { spec: CompiledTaskSpec } }
   | { type: 'STOP_TASK' }
+  | { type: 'RESUME_TASK'; payload: { taskId: string; checkpointId?: string } }
+  | { type: 'GET_CHECKPOINTS'; payload: { taskId: string } }
   | { type: 'CLEAR_ALERTS' }
   | { type: 'GET_MODELS' }
   | { type: 'SET_MODEL'; payload: { model: string } }
@@ -247,7 +348,11 @@ export type WsClientToServerMessage =
   | { type: 'QUERY_RESULTS'; payload: { query: string; taskId?: string } }
   | { type: 'STEER_TASK'; payload: { instruction: string; taskId?: string } }
   | { type: 'GET_RESULTS'; payload: { taskId?: string } }
-  | { type: 'GET_MODEL_STATS' };
+  | { type: 'GET_MODEL_STATS' }
+  | { type: 'DOWNLOAD_MODEL'; payload: { modelId: string } }
+  | { type: 'CANCEL_DOWNLOAD'; payload: { modelId: string } }
+  | { type: 'LOAD_MODEL'; payload: { modelId: string } }
+  | { type: 'GET_GGUF_MODELS' };
 
 export type WsServerToClientMessage =
   | {
@@ -273,8 +378,11 @@ export type WsServerToClientMessage =
           };
         };
         modelStats?: ModelStats;
+        lastCheckpoint?: TaskCheckpoint;
       };
     }
+  | { type: 'CHECKPOINT_SAVED'; payload: TaskCheckpoint }
+  | { type: 'CHECKPOINTS_LIST'; payload: TaskCheckpoint[] }
   | { type: 'COMPILATION_PROGRESS'; payload: { status: 'compiling' | 'ready' | 'error'; message: string; spec?: CompiledTaskSpec } }
   | { type: 'INFERENCE_EVENT'; payload: InferenceTelemetryItem }
   | { type: 'ALERT_MATCH'; payload: InferenceTelemetryItem }
@@ -288,4 +396,27 @@ export type WsServerToClientMessage =
   | { type: 'QUERY_RESULTS_RESPONSE'; payload: { query: string; answer: string; timestamp: string; model: string } }
   | { type: 'STEER_TASK_RESPONSE'; payload: { instruction: string; explanation: string; applied: boolean; timestamp: string } }
   | { type: 'RESULTS_UPDATE'; payload: { markdown: string; summary: string; stats: ResultStats; items: ScrapedItem[]; timestamp: string } }
-  | { type: 'MODEL_STATS'; payload: ModelStats };
+  | { type: 'MODEL_STATS'; payload: ModelStats }
+  | {
+      type: 'MODEL_DOWNLOAD_PROGRESS';
+      payload: {
+        modelId: string;
+        percent: number;
+        downloadedMb: number;
+        totalMb: number;
+        speedMbps: number;
+        status: 'downloading' | 'completed' | 'error' | 'cancelled';
+        error?: string;
+      };
+    }
+  | {
+      type: 'GGUF_MODELS_LIST';
+      payload: {
+        models: GgufModelInfo[];
+        activeModelId: string | null;
+        gpuName: string;
+        gpuBackend: string;
+        vramUsageMb: number;
+        totalVramMb: number;
+      };
+    };

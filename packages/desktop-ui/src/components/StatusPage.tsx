@@ -33,6 +33,8 @@ export const StatusPage: React.FC = () => {
   const daemonStatus = useScoutStore((state) => state.daemonStatus);
   const ollamaOnline = useScoutStore((state) => state.ollamaOnline);
   const selectedModel = useScoutStore((state) => state.selectedModel);
+  const activeGgufModelId = useScoutStore((state) => state.activeGgufModelId);
+  const gpuName = useScoutStore((state) => state.gpuName);
 
   // Poll metrics if needed on mount
   useEffect(() => {
@@ -93,9 +95,11 @@ export const StatusPage: React.FC = () => {
       message: daemonStatus.isRunning ? 'Chromium runner active' : 'Standby',
     },
     ollama: {
-      name: 'Ollama LLM Engine',
-      status: ollamaOnline ? 'healthy' : 'degraded',
-      message: ollamaOnline ? `Model: ${selectedModel}` : 'Offline - fallback active',
+      name: 'System 2 (Llama.cpp)',
+      status: activeGgufModelId ? 'healthy' : (ollamaOnline ? 'healthy' : 'degraded'),
+      message: activeGgufModelId
+        ? `Model: ${activeGgufModelId} (${gpuName || 'GPU'})`
+        : (ollamaOnline ? `Model: ${selectedModel}` : 'Offline - template fallback active'),
     },
   };
 
@@ -235,20 +239,20 @@ export const StatusPage: React.FC = () => {
             </div>
           </div>
 
-          {/* 5. Ollama LLM */}
+          {/* 5. System 2 Llama.cpp Engine */}
           <div className="bg-[#242427] border border-[#383842] rounded-xl p-4 shadow-sm flex flex-col justify-between">
             <div>
               <div className="flex items-center justify-between mb-2">
-                <div className="w-8 h-8 rounded-lg bg-[#F59E0B]/15 border border-[#F59E0B]/30 flex items-center justify-center">
-                  <Brain className="w-4 h-4 text-[#F59E0B]" />
+                <div className="w-8 h-8 rounded-lg bg-[#8B5CF6]/15 border border-[#8B5CF6]/30 flex items-center justify-center">
+                  <Brain className="w-4 h-4 text-[#8B5CF6]" />
                 </div>
-                {getServiceStatusBadge(services.ollama?.status || (ollamaOnline ? 'healthy' : 'degraded'))}
+                {getServiceStatusBadge(services.ollama?.status || (activeGgufModelId ? 'healthy' : ollamaOnline ? 'healthy' : 'degraded'))}
               </div>
-              <h4 className="text-sm font-semibold text-white mb-0.5">Ollama LLM</h4>
-              <p className="text-xs text-gray-400 font-mono truncate">{selectedModel}</p>
+              <h4 className="text-sm font-semibold text-white mb-0.5">System 2 Engine</h4>
+              <p className="text-xs text-gray-400 font-mono truncate">{activeGgufModelId || selectedModel}</p>
             </div>
             <div className="mt-3 pt-2 border-t border-[#383842] text-[11px] text-gray-400 truncate">
-              {services.ollama?.message || (ollamaOnline ? 'System 2 Ready' : 'Template Fallback')}
+              {services.ollama?.message || (activeGgufModelId ? 'Llama.cpp GPU Ready' : 'Template Fallback')}
             </div>
           </div>
         </div>

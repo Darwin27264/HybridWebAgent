@@ -44,22 +44,22 @@ async function main() {
     {
       id: '1',
       name: 'Tier 1: Isolated Features',
-      files: ['./tier1-features.test', './tier1-features.spec'],
+      files: ['./tier1-features.test', './tier1-features.spec', './tier1-browser-enhancement.spec'],
     },
     {
       id: '2',
       name: 'Tier 2: Boundary & Corner Cases',
-      files: ['./tier2-boundary.test', './tier2-boundary.spec'],
+      files: ['./tier2-boundary.test', './tier2-boundary.spec', './tier2-browser-enhancement.spec'],
     },
     {
       id: '3',
       name: 'Tier 3: Pairwise Combinations',
-      files: ['./tier3-pairwise.test', './tier3-combinations.spec'],
+      files: ['./tier3-pairwise.test', './tier3-combinations.spec', './tier3-browser-enhancement.spec'],
     },
     {
       id: '4',
       name: 'Tier 4: Realistic E2E Scenarios',
-      files: ['./tier4-scenarios.test', './tier4-scenarios.spec'],
+      files: ['./tier4-scenarios.test', './tier4-scenarios.spec', './tier4-browser-enhancement.spec'],
     },
   ].filter(t => !requestedTier || t.id === requestedTier);
 

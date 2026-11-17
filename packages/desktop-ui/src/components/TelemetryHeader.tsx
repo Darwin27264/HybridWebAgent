@@ -3,37 +3,22 @@ import {
   Activity,
   Wifi,
   WifiOff,
-  Play,
-  Square,
   Cpu,
   ShieldAlert,
   Clock,
-  RotateCw,
   Layers,
   Calendar,
   BarChart3,
 } from 'lucide-react';
 import { AreaChart, Area, YAxis } from 'recharts';
 import { useScoutStore, formatLatency } from '../store/useScoutStore';
-import { wsClient } from '../lib/wsClient';
 
 export const TelemetryHeader: React.FC = () => {
   const wsConnected = useScoutStore((state) => state.wsConnected);
   const daemonStatus = useScoutStore((state) => state.daemonStatus);
-  const isLaunching = useScoutStore((state) => state.isLaunching);
-  const isStopping = useScoutStore((state) => state.isStopping);
   const telemetryStats = useScoutStore((state) => state.telemetryStats);
-  const currentSpec = useScoutStore((state) => state.currentSpec);
   const activeTab = useScoutStore((state) => state.activeTab);
   const setActiveTab = useScoutStore((state) => state.setActiveTab);
-
-  const handleToggleTask = () => {
-    if (daemonStatus.isRunning) {
-      wsClient.stopTask();
-    } else if (currentSpec) {
-      wsClient.startTask(currentSpec);
-    }
-  };
 
   // Prepare data points for Recharts sparkline
   const sparklineData =
@@ -219,42 +204,6 @@ export const TelemetryHeader: React.FC = () => {
             </div>
           </div>
         </div>
-
-        {/* Task Start / Stop Toggle Button with Immediate Feedback & Spinners */}
-        <button
-          onClick={handleToggleTask}
-          disabled={!wsConnected || isLaunching || isStopping || (!daemonStatus.isRunning && !currentSpec)}
-          className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed ${
-            daemonStatus.isRunning
-              ? 'bg-[#EF4444] hover:bg-[#dc2626] text-white'
-              : !currentSpec
-              ? 'bg-[#27272a] text-gray-500 cursor-not-allowed border border-[#383842]'
-              : 'bg-[#10B981] hover:bg-[#059669] text-black font-semibold'
-          }`}
-          title={!currentSpec ? 'Please compile or select a task spec first' : undefined}
-        >
-          {isStopping ? (
-            <>
-              <RotateCw className="w-4 h-4 animate-spin" />
-              <span>Stopping...</span>
-            </>
-          ) : isLaunching ? (
-            <>
-              <RotateCw className="w-4 h-4 animate-spin text-black" />
-              <span>Starting...</span>
-            </>
-          ) : daemonStatus.isRunning ? (
-            <>
-              <Square className="w-4 h-4 fill-current" />
-              <span>Stop Task</span>
-            </>
-          ) : (
-            <>
-              <Play className="w-4 h-4 fill-current" />
-              <span>Start Task</span>
-            </>
-          )}
-        </button>
       </div>
     </header>
   );

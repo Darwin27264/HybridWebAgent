@@ -1,18 +1,21 @@
 import React, { useEffect } from 'react';
 import { Toaster } from 'sonner';
 import { TelemetryHeader } from './components/TelemetryHeader';
-import { TaskStudio } from './components/TaskStudio';
-import { DecisionMatrix } from './components/DecisionMatrix';
-import { AlertsDrawer } from './components/AlertsDrawer';
-import { LiveBrowserView } from './components/LiveBrowserView';
-import { AgentActionTimeline } from './components/AgentActionTimeline';
+import { WorkflowNavigator } from './components/WorkflowNavigator';
+import { Page1GoalModelSetup } from './components/pages/Page1GoalModelSetup';
+import { Page2SpecInspector } from './components/pages/Page2SpecInspector';
+import { Page3LiveExecution } from './components/pages/Page3LiveExecution';
+import { Page4ResultsSteering } from './components/pages/Page4ResultsSteering';
 import { JobManager } from './components/JobManager';
 import { StatusPage } from './components/StatusPage';
+import { ResultsPanel } from './components/ResultsPanel';
+import { ChatConsole } from './components/ChatConsole';
 import { useScoutStore } from './store/useScoutStore';
 import { wsClient } from './lib/wsClient';
 
 export const App: React.FC = () => {
   const activeTab = useScoutStore((state) => state.activeTab);
+  const currentPage = useScoutStore((state) => state.currentPage);
 
   useEffect(() => {
     // Initiate resilient WebSocket connection on application start
@@ -28,38 +31,40 @@ export const App: React.FC = () => {
       {/* Top Telemetry & Control Bar with Navigation Switcher */}
       <TelemetryHeader />
 
+      {/* Sequential Workflow Navigator when on Workbench */}
+      {activeTab === 'workbench' && <WorkflowNavigator />}
+
       {/* Main Fluid Responsive Workspace Viewport */}
-      <main className="flex-1 p-6 w-full mx-auto">
+      <main className="flex-1 w-full mx-auto">
         {activeTab === 'workbench' && (
-          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-            {/* Column 1: System 2 Task Builder & Spec Inspector (4 cols) */}
-            <div className="xl:col-span-4 flex flex-col gap-6">
-              <TaskStudio />
-            </div>
-
-            {/* Column 2: Live Browser View & Agent Action Trajectory (4 cols) */}
-            <div className="xl:col-span-4 flex flex-col gap-6">
-              <LiveBrowserView />
-              <AgentActionTimeline />
-            </div>
-
-            {/* Column 3: System 1 Live Inference Stream & Flagged Matches (4 cols) */}
-            <div className="xl:col-span-4 flex flex-col gap-6">
-              <DecisionMatrix />
-              <AlertsDrawer />
-            </div>
+          <div className="w-full">
+            {currentPage === 1 && <Page1GoalModelSetup />}
+            {currentPage === 2 && <Page2SpecInspector />}
+            {currentPage === 3 && <Page3LiveExecution />}
+            {currentPage === 4 && <Page4ResultsSteering />}
           </div>
         )}
 
         {activeTab === 'jobs' && (
-          <div className="w-full max-w-7xl mx-auto">
+          <div className="w-full max-w-[1920px] mx-auto p-6 lg:px-8 xl:px-10">
             <JobManager />
           </div>
         )}
 
         {activeTab === 'status' && (
-          <div className="w-full max-w-7xl mx-auto">
+          <div className="w-full max-w-[1920px] mx-auto p-6 lg:px-8 xl:px-10">
             <StatusPage />
+          </div>
+        )}
+
+        {activeTab === 'results' && (
+          <div className="w-full max-w-[1920px] mx-auto p-6 lg:px-8 xl:px-10 grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+            <div className="xl:col-span-7 flex flex-col gap-6">
+              <ResultsPanel />
+            </div>
+            <div className="xl:col-span-5 flex flex-col gap-6">
+              <ChatConsole />
+            </div>
           </div>
         )}
       </main>

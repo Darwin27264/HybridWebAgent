@@ -9,21 +9,31 @@ import type {
   AgentAction,
   BrowserSnapshot,
   Job,
-  ScrapedItem
+  ScrapedItem,
+  ModelStats,
+  ModelLoadingStatus,
+  TaskCheckpoint
 } from '@ofln-scout/shared';
 import type { ScoutDatabase } from './db.js';
 import type { LayaEngine } from './engine/layaEngine.js';
 import type { BrowserRunner } from './runner/browserRunner.js';
-import { compileTask, fetchOllamaModels } from './engine/compiler.js';
+import {
+  compileTask,
+  fetchOllamaModels,
+  fetchOllamaPs,
+  getSystemTwoModelStats,
+  DEFAULT_OLLAMA_MODELS
+} from './engine/compiler.js';
 import { SystemMonitor } from './engine/systemMonitor.js';
 import { JobScheduler } from './scheduler.js';
 import { ResultsStore } from './resultsStore.js';
+import { llamaEngine } from './engine/llamaEngine.js';
 import {
   generateResultsSummary,
   queryResults,
   steerTask
 } from './engine/systemTwoAssistant.js';
-import type { ScoutWsServerOptions, DaemonStatusPayload } from './types.js';
+import type { ScoutWsServerOptions, DaemonStatusPayload, ActiveModelMetadata } from './types.js';
 
 export class ScoutWsServer extends EventEmitter {
   private wss: WebSocketServer;
@@ -35,16 +45,32 @@ export class ScoutWsServer extends EventEmitter {
   private _host: string;
   private _port: number;
   private isRunning = false;
+  private _isStopping = false;
   private layaReady = false;
   private activeTaskId: string | null = null;
   private _activeRunId: string | null = null;
   private activeJobId: string | null = null;
   private activeAbortController: AbortController | null = null;
   private activeExecutionPromise: Promise<void> | null = null;
+  private lastKnownCheckpoint?: TaskCheckpoint;
   private isClosed = false;
   private readyPromise: Promise<void>;
 
   private _selectedModel = 'qwen2.5';
+  private _systemOneStats: ModelStats['systemOne'] = {
+    modelName: 'laya.onnx',
+    format: 'fp32',
+    provider: 'cpu',
+    device: 'CPU',
+    status: 'idle',
+    avgLatencyMs: 0
+  };
+  private _systemTwoStatus: ModelLoadingStatus = 'idle';
+  private _availableModels: string[] = [...DEFAULT_OLLAMA_MODELS];
+  private _systemTwoVramMb?: number;
+  private _systemTwoGpuOffloaded?: boolean;
+  private _systemTwoError?: string;
+  private _activeModelMetadata?: ActiveModelMetadata;
   private _systemMonitor: SystemMonitor;
   private _scheduler: JobScheduler;
 
@@ -52,6 +78,14 @@ export class ScoutWsServer extends EventEmitter {
     super();
     this.db = options.db;
     this.layaEngine = options.layaEngine;
+    if (this.layaEngine) {
+      this.layaReady = this.layaEngine.isReady;
+      if (typeof (this.layaEngine as any).getModelStats === 'function') {
+        this._systemOneStats = (this.layaEngine as any).getModelStats();
+      } else {
+        this._systemOneStats.status = this.layaReady ? 'ready' : 'idle';
+      }
+    }
     this.browserRunner = options.browserRunner;
     this.resultsStore = options.resultsStore ?? new ResultsStore();
     this._host = options.host ?? process.env.SCOUT_WS_HOST ?? '127.0.0.1';
@@ -127,11 +161,7 @@ export class ScoutWsServer extends EventEmitter {
       // 1. Send current status upon client connection
       const statusMsg: WsServerToClientMessage = {
         type: 'DAEMON_STATUS',
-        payload: {
-          isRunning: this.isRunning,
-          layaReady: this.layaReady,
-          activeTaskId: this.activeTaskId
-        }
+        payload: this.getDaemonStatusPayload()
       };
 
       if (client.readyState === WebSocket.OPEN) {
@@ -140,6 +170,9 @@ export class ScoutWsServer extends EventEmitter {
 
       // 2. Send initial models list
       fetchOllamaModels().then((modelsData) => {
+        if (modelsData.models && modelsData.models.length > 0) {
+          this._availableModels = modelsData.models;
+        }
         if (client.readyState === WebSocket.OPEN) {
           const modelsMsg: WsServerToClientMessage = {
             type: 'MODELS_LIST',
@@ -151,6 +184,24 @@ export class ScoutWsServer extends EventEmitter {
           };
           client.send(JSON.stringify(modelsMsg));
         }
+
+        // Send GGUF models list with download and GPU telemetry
+        llamaEngine.getTelemetry().then((telemetry) => {
+          if (client.readyState === WebSocket.OPEN) {
+            const ggufMsg: WsServerToClientMessage = {
+              type: 'GGUF_MODELS_LIST',
+              payload: {
+                models: llamaEngine.getModelsList(),
+                activeModelId: llamaEngine.getActiveModelId(),
+                gpuName: telemetry.gpuName,
+                gpuBackend: telemetry.gpuBackend,
+                vramUsageMb: telemetry.vramUsageMb,
+                totalVramMb: telemetry.totalVramMb
+              }
+            };
+            client.send(JSON.stringify(ggufMsg));
+          }
+        }).catch(() => {});
       });
 
       // 3. Send current metrics
@@ -189,10 +240,19 @@ export class ScoutWsServer extends EventEmitter {
         }
       }
 
+      // 6. Send initial MODEL_STATS
+      if (client.readyState === WebSocket.OPEN) {
+        const modelStatsMsg: WsServerToClientMessage = {
+          type: 'MODEL_STATS',
+          payload: this.getModelStats()
+        };
+        client.send(JSON.stringify(modelStatsMsg));
+      }
+
       this.emit('client_connected', client);
 
       // 5. Setup incoming message handling
-      client.on('message', (data) => {
+      client.on('message', async (data) => {
         let message: WsClientToServerMessage;
         try {
           message = JSON.parse(data.toString()) as WsClientToServerMessage;
@@ -201,7 +261,7 @@ export class ScoutWsServer extends EventEmitter {
           return;
         }
         try {
-          this.handleClientMessage(message, client);
+          await this.handleClientMessage(message, client);
         } catch (err: any) {
           console.warn('[ScoutWsServer] Error handling client message:', err.message);
         }
@@ -224,7 +284,7 @@ export class ScoutWsServer extends EventEmitter {
   /**
    * Route incoming client message according to defined contracts.
    */
-  private handleClientMessage(msg: WsClientToServerMessage, client: WebSocket): void {
+  private async handleClientMessage(msg: WsClientToServerMessage, client: WebSocket): Promise<void> {
     if (!msg || typeof msg !== 'object' || !msg.type) {
       return;
     }
@@ -245,6 +305,9 @@ export class ScoutWsServer extends EventEmitter {
         this.broadcast(progress);
         this.emit('compile_task', msg.payload, client);
 
+        this._systemTwoStatus = 'loading';
+        this.broadcastModelStats();
+
         const modelToUse = msg.payload.ollamaModel || this._selectedModel;
 
         compileTask(msg.payload.userGoal, modelToUse)
@@ -252,6 +315,8 @@ export class ScoutWsServer extends EventEmitter {
             if (this.db && this.db.isOpen) {
               this.db.insertTask(spec);
             }
+            this._systemTwoStatus = 'ready';
+            this.broadcastModelStats();
             this.broadcast({
               type: 'COMPILATION_PROGRESS',
               payload: {
@@ -262,6 +327,9 @@ export class ScoutWsServer extends EventEmitter {
             });
           })
           .catch((err: Error) => {
+            this._systemTwoStatus = 'error';
+            this._systemTwoError = err.message;
+            this.broadcastModelStats();
             this.broadcast({
               type: 'COMPILATION_PROGRESS',
               payload: {
@@ -296,16 +364,50 @@ export class ScoutWsServer extends EventEmitter {
       }
 
       case 'STOP_TASK': {
-        if (this.activeAbortController) {
-          this.activeAbortController.abort();
-          this.activeAbortController = null;
-        }
-        this.isRunning = false;
-        this.activeTaskId = null;
-        this._activeRunId = null;
-        this.activeJobId = null;
-        this.broadcastStatus();
+        await this.stopTask();
         this.emit('stop_task', client);
+        break;
+      }
+
+      case 'RESUME_TASK': {
+        if (!msg.payload || !msg.payload.taskId) {
+          console.warn('[ScoutWsServer] RESUME_TASK received without taskId');
+          break;
+        }
+        this.emit('resume_task', msg.payload, client);
+        this.resumeTask(msg.payload.taskId, msg.payload.checkpointId).catch((err: Error) => {
+          console.warn(`[ScoutWsServer] resumeTask error: ${err.message}`);
+          this.broadcast({
+            type: 'DAEMON_NOTIFICATION',
+            payload: {
+              level: 'error',
+              title: 'Resume Failed',
+              message: err.message,
+              timestamp: Date.now()
+            }
+          });
+        });
+        break;
+      }
+
+      case 'GET_CHECKPOINTS': {
+        if (!msg.payload || !msg.payload.taskId) {
+          console.warn('[ScoutWsServer] GET_CHECKPOINTS received without taskId');
+          break;
+        }
+        let checkpoints: TaskCheckpoint[] = [];
+        if (this.db && this.db.isOpen) {
+          checkpoints = this.db.listCheckpoints(msg.payload.taskId);
+        } else if (this.lastKnownCheckpoint && this.lastKnownCheckpoint.taskId === msg.payload.taskId) {
+          checkpoints = [this.lastKnownCheckpoint];
+        }
+        const reply: WsServerToClientMessage = {
+          type: 'CHECKPOINTS_LIST',
+          payload: checkpoints
+        };
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(reply));
+        }
         break;
       }
 
@@ -341,25 +443,117 @@ export class ScoutWsServer extends EventEmitter {
           break;
         }
         this._selectedModel = msg.payload.model;
-        fetchOllamaModels().then((data) => {
-          this.broadcast({
-            type: 'MODELS_LIST',
-            payload: {
-              models: data.models,
-              selectedModel: this._selectedModel,
-              ollamaOnline: data.online
+        this._systemTwoStatus = 'loading';
+        this.broadcastModelStats();
+
+        getSystemTwoModelStats(this._selectedModel)
+          .then((stats) => {
+            this._systemTwoStatus = stats.status;
+            this._systemTwoVramMb = stats.vramUsageMb;
+            this._systemTwoGpuOffloaded = stats.gpuOffloaded;
+            this._systemTwoError = stats.error;
+            if (stats.availableModels.length > 0) {
+              this._availableModels = stats.availableModels;
             }
+            this.broadcast({
+              type: 'MODELS_LIST',
+              payload: {
+                models: this._availableModels,
+                selectedModel: this._selectedModel,
+                ollamaOnline: stats.status !== 'idle' && !stats.error?.includes('offline')
+              }
+            });
+            this.broadcastModelStats();
+            this.broadcast({
+              type: 'DAEMON_NOTIFICATION',
+              payload: {
+                level: 'info',
+                title: 'Model Selected',
+                message: `Active System 2 model set to "${this._selectedModel}"`,
+                timestamp: Date.now()
+              }
+            });
+          })
+          .catch((err: Error) => {
+            this._systemTwoStatus = 'error';
+            this._systemTwoError = err.message;
+            this.broadcastModelStats();
           });
-          this.broadcast({
-            type: 'DAEMON_NOTIFICATION',
+        break;
+      }
+
+      case 'GET_GGUF_MODELS': {
+        llamaEngine.getTelemetry().then((telemetry) => {
+          const reply: WsServerToClientMessage = {
+            type: 'GGUF_MODELS_LIST',
             payload: {
-              level: 'info',
-              title: 'Model Selected',
-              message: `Active System 2 model set to "${this._selectedModel}"`,
-              timestamp: Date.now()
+              models: llamaEngine.getModelsList(),
+              activeModelId: llamaEngine.getActiveModelId(),
+              gpuName: telemetry.gpuName,
+              gpuBackend: telemetry.gpuBackend,
+              vramUsageMb: telemetry.vramUsageMb,
+              totalVramMb: telemetry.totalVramMb
             }
+          };
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(reply));
+          }
+        }).catch(() => {});
+        break;
+      }
+
+      case 'DOWNLOAD_MODEL': {
+        if (!msg.payload || !msg.payload.modelId) break;
+        const targetModelId = msg.payload.modelId;
+        this.broadcastNotification('info', 'Download Started', `Downloading "${targetModelId}" from Hugging Face...`);
+
+        llamaEngine.downloadModel(targetModelId, (progress) => {
+          this.broadcast({
+            type: 'MODEL_DOWNLOAD_PROGRESS',
+            payload: progress
           });
+          if (progress.status === 'completed') {
+            this.broadcastGgufModels();
+            this.broadcastNotification('info', 'Download Completed', `Model "${targetModelId}" is downloaded and ready to load.`);
+          }
+        }).catch((err: Error) => {
+          this.broadcastNotification('error', 'Download Failed', err.message);
         });
+        break;
+      }
+
+      case 'CANCEL_DOWNLOAD': {
+        if (!msg.payload || !msg.payload.modelId) break;
+        await llamaEngine.cancelDownload(msg.payload.modelId);
+        this.broadcastGgufModels();
+        this.broadcastNotification('info', 'Download Cancelled', `Download of "${msg.payload.modelId}" was cancelled.`);
+        break;
+      }
+
+      case 'LOAD_MODEL': {
+        if (!msg.payload || !msg.payload.modelId) break;
+        const loadTarget = msg.payload.modelId;
+        this._systemTwoStatus = 'loading';
+        this.broadcastModelStats();
+
+        try {
+          await llamaEngine.loadModel(loadTarget);
+          this._selectedModel = loadTarget;
+          this._systemTwoStatus = 'ready';
+          const telemetry = await llamaEngine.getTelemetry();
+          this._systemTwoVramMb = telemetry.vramUsageMb;
+          this._systemTwoGpuOffloaded = telemetry.gpuOffloaded;
+          this._systemTwoError = undefined;
+
+          await this.broadcastGgufModels();
+          this.broadcastModelStats();
+          this.broadcastNotification('info', 'Model Activated', `"${loadTarget}" is active on GPU (${telemetry.gpuName}).`);
+        } catch (err: any) {
+          this._systemTwoStatus = 'error';
+          this._systemTwoError = err?.message || String(err);
+          this.broadcastModelStats();
+          this.broadcastNotification('error', 'Model Load Error', err?.message || String(err));
+        }
         break;
       }
 
@@ -638,6 +832,9 @@ export class ScoutWsServer extends EventEmitter {
                 (!requestedTaskId && this.activeSpec)
               ) {
                 this.activeSpec = res.updatedSpec;
+                if (this.isRunning && this.browserRunner) {
+                  this.browserRunner.applySteering(res.updatedSpec);
+                }
               }
               if (this.db && this.db.isOpen) {
                 this.db.insertTask(res.updatedSpec);
@@ -686,6 +883,17 @@ export class ScoutWsServer extends EventEmitter {
         break;
       }
 
+      case 'GET_MODEL_STATS': {
+        const statsMsg: WsServerToClientMessage = {
+          type: 'MODEL_STATS',
+          payload: this.getModelStats()
+        };
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(JSON.stringify(statsMsg));
+        }
+        break;
+      }
+
       default:
         // Unknown message type
         break;
@@ -693,10 +901,133 @@ export class ScoutWsServer extends EventEmitter {
   }
 
   /**
+   * Stop the active task execution, checkpointing runner coordinates to SQLite.
+   */
+  public async stopTask(): Promise<TaskCheckpoint | null> {
+    if (this._isStopping || !this.isRunning || !this.activeTaskId || !this.activeSpec) {
+      return null;
+    }
+    this._isStopping = true;
+
+    const activeTaskId = this.activeTaskId;
+    const activeSpec = this.activeSpec;
+    const activeRunId = this._activeRunId;
+    const activeAbortController = this.activeAbortController;
+
+    try {
+      let runnerState: any = null;
+      if (this.browserRunner) {
+        try {
+          runnerState = await this.browserRunner.getCurrentState();
+        } catch {
+          // fallback
+        }
+      }
+      const now = Date.now();
+      const savedCheckpoint: TaskCheckpoint = {
+        id: `chk-${now}-${Math.random().toString(36).slice(2, 7)}`,
+        taskId: activeTaskId,
+        runId: activeRunId || `run-${now}`,
+        createdAt: now,
+        updatedAt: now,
+        status: 'stopped',
+        targetUrl: activeSpec.targetUrl,
+        currentUrl: runnerState?.currentUrl || activeSpec.targetUrl,
+        pageTitle: runnerState?.pageTitle,
+        scroll: runnerState?.scroll || { y: 0, scrollHeight: 0, viewportHeight: 0 },
+        totalScanned: runnerState?.totalScanned ?? (this.resultsStore?.getStats().totalScanned ?? 0),
+        totalAlerts: runnerState?.totalAlerts ?? (this.resultsStore?.getStats().totalAlerts ?? 0),
+        activeStepCount: runnerState?.activeStepCount ?? 0,
+        dedupHashes: runnerState?.dedupHashes ?? (this.browserRunner?.deduplicator.getHashes() || []),
+        modelConfig: {
+          systemOneModel: this._systemOneStats.modelName,
+          systemTwoModel: this._selectedModel
+        }
+      };
+
+      if (this.db && this.db.isOpen) {
+        try {
+          this.db.insertTask(activeSpec);
+          this.db.saveCheckpoint(savedCheckpoint);
+        } catch (err: any) {
+          console.warn('[ScoutWsServer] Error saving checkpoint on stopTask:', err.message);
+        }
+      }
+      this.lastKnownCheckpoint = savedCheckpoint;
+      this.broadcast({
+        type: 'CHECKPOINT_SAVED',
+        payload: savedCheckpoint
+      });
+
+      if (activeAbortController) {
+        activeAbortController.abort();
+        if (this.activeAbortController === activeAbortController) {
+          this.activeAbortController = null;
+        }
+      }
+
+      if (this.activeTaskId === activeTaskId && (this._activeRunId === null || this._activeRunId === activeRunId)) {
+        this.isRunning = false;
+        this.activeTaskId = null;
+        this._activeRunId = null;
+        this.activeJobId = null;
+        this.broadcastStatus();
+      }
+      return savedCheckpoint;
+    } finally {
+      this._isStopping = false;
+    }
+  }
+
+  /**
+   * Resume an existing task from a checkpoint.
+   */
+  public async resumeTask(taskId: string, checkpointId?: string): Promise<string> {
+    if (this._isStopping) {
+      const startWait = Date.now();
+      while (this._isStopping && Date.now() - startWait < 5000) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+
+    let checkpoint: TaskCheckpoint | null = null;
+    if (this.db && this.db.isOpen) {
+      if (checkpointId) {
+        checkpoint = this.db.getCheckpoint(checkpointId);
+      }
+      if (!checkpoint) {
+        checkpoint = this.db.getLatestCheckpoint(taskId);
+      }
+    }
+    if (!checkpoint && this.lastKnownCheckpoint && this.lastKnownCheckpoint.taskId === taskId) {
+      checkpoint = this.lastKnownCheckpoint;
+    }
+    if (!checkpoint) {
+      throw new Error(`No checkpoint found for task "${taskId}"`);
+    }
+
+    let spec: CompiledTaskSpec | null = null;
+    if (this.activeSpec && this.activeSpec.id === taskId) {
+      spec = this.activeSpec;
+    } else if (this.db && this.db.isOpen) {
+      spec = this.db.getTask(taskId);
+    }
+    if (!spec) {
+      throw new Error(`Task specification not found for task "${taskId}"`);
+    }
+
+    return this.startExecution(spec, undefined, checkpoint);
+  }
+
+  /**
    * Core execution pipeline: isolates lifecycle using a unique runId to prevent
    * race conditions and premature state clearing from prior runs' .finally() blocks.
    */
-  public async startExecution(spec: CompiledTaskSpec, jobId?: string): Promise<string> {
+  public async startExecution(
+    spec: CompiledTaskSpec,
+    jobId?: string,
+    resumeCheckpoint?: TaskCheckpoint
+  ): Promise<string> {
     if (!spec || !spec.id) {
       console.warn('[ScoutWsServer] startExecution called with missing or invalid spec');
       return '';
@@ -726,7 +1057,12 @@ export class ScoutWsServer extends EventEmitter {
     this.activeTaskId = spec.id;
     this.activeSpec = spec;
     if (this.resultsStore) {
-      this.resultsStore.initTask(spec);
+      if (!resumeCheckpoint) {
+        this.resultsStore.initTask(spec);
+      }
+    }
+    if (resumeCheckpoint) {
+      this.lastKnownCheckpoint = resumeCheckpoint;
     }
     this.activeJobId = jobId ?? null;
     this.isRunning = true;
@@ -753,8 +1089,8 @@ export class ScoutWsServer extends EventEmitter {
       const controller = new AbortController();
       this.activeAbortController = controller;
 
-      let scannedCount = 0;
-      let alertCount = 0;
+      let scannedCount = resumeCheckpoint ? (resumeCheckpoint.totalScanned || 0) : 0;
+      let alertCount = resumeCheckpoint ? (resumeCheckpoint.totalAlerts || 0) : 0;
       let latencySum = 0;
 
       const runPromise = (async () => {
@@ -812,6 +1148,11 @@ export class ScoutWsServer extends EventEmitter {
             controller.signal,
             (action: AgentAction) => {
               if (this._activeRunId === currentRunId) {
+                if (this.db && this.db.isOpen) {
+                  try {
+                    this.db.saveAgentAction(action, currentRunId);
+                  } catch {}
+                }
                 this.broadcast({
                   type: 'AGENT_ACTION',
                   payload: action
@@ -824,6 +1165,38 @@ export class ScoutWsServer extends EventEmitter {
                   type: 'BROWSER_SNAPSHOT',
                   payload: snapshot
                 });
+              }
+            },
+            () => alertCount,
+            resumeCheckpoint,
+            async (chk) => {
+              if (this.db && this.db.isOpen && this._activeRunId === currentRunId) {
+                const periodicCheckpoint: TaskCheckpoint = {
+                  id: `chk-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                  taskId: spec.id,
+                  runId: currentRunId,
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                  status: 'running',
+                  targetUrl: chk.targetUrl || spec.targetUrl,
+                  currentUrl: chk.currentUrl || spec.targetUrl,
+                  pageTitle: chk.pageTitle,
+                  scroll: chk.scroll || { y: 0, scrollHeight: 0, viewportHeight: 0 },
+                  totalScanned: chk.totalScanned ?? scannedCount,
+                  totalAlerts: chk.totalAlerts ?? alertCount,
+                  activeStepCount: chk.activeStepCount ?? 0,
+                  dedupHashes: chk.dedupHashes ?? [],
+                  modelConfig: {
+                    systemOneModel: this._systemOneStats.modelName,
+                    systemTwoModel: this._selectedModel
+                  }
+                };
+                try {
+                  this.db.saveCheckpoint(periodicCheckpoint);
+                  this.lastKnownCheckpoint = periodicCheckpoint;
+                } catch {
+                  // ignore
+                }
               }
             }
           );
@@ -921,18 +1294,226 @@ export class ScoutWsServer extends EventEmitter {
     }
   }
 
+  public getDaemonStatusPayload(): DaemonStatusPayload & { lastCheckpoint?: TaskCheckpoint } {
+    const payload: DaemonStatusPayload & { lastCheckpoint?: TaskCheckpoint } = {
+      isRunning: this.isRunning,
+      layaReady: this.layaReady,
+      activeTaskId: this.activeTaskId
+    };
+    if (this._activeRunId) {
+      payload.activeRunId = this._activeRunId;
+    }
+    // Only attach activeModel when layaEngine is present, layaReady is true, or metadata is configured
+    if (this.layaEngine || this.layaReady || this._activeModelMetadata) {
+      payload.activeModel = this.getActiveModelMetadata();
+    }
+    let lastCheckpoint: TaskCheckpoint | undefined = this.lastKnownCheckpoint;
+    if (this.db && this.db.isOpen) {
+      try {
+        if (this.activeTaskId) {
+          const chk = this.db.getLatestCheckpoint(this.activeTaskId);
+          if (chk) lastCheckpoint = chk;
+        } else if (!lastCheckpoint) {
+          const tasks = this.db.listTasks();
+          if (tasks.length > 0 && tasks[0].id) {
+            const chk = this.db.getLatestCheckpoint(tasks[0].id);
+            if (chk) lastCheckpoint = chk;
+          }
+        }
+      } catch {
+        // Ignore DB query errors
+      }
+    }
+    if (lastCheckpoint) {
+      payload.lastCheckpoint = lastCheckpoint;
+    }
+    return payload;
+  }
+
+  public getActiveModelMetadata(): ActiveModelMetadata | undefined {
+    if (this._activeModelMetadata) {
+      return this._activeModelMetadata;
+    }
+    const currentStats = this.getModelStats();
+    return {
+      systemOne: {
+        name: currentStats.systemOne.modelName,
+        format: currentStats.systemOne.format,
+        provider: currentStats.systemOne.provider,
+        device: currentStats.systemOne.device,
+        status: currentStats.systemOne.status
+      },
+      systemTwo: {
+        name: currentStats.systemTwo.modelName,
+        status: currentStats.systemTwo.status,
+        gpuOffloaded: currentStats.systemTwo.gpuOffloaded,
+        vramUsageMb: currentStats.systemTwo.vramUsageMb
+      }
+    };
+  }
+
+  public setActiveModelMetadata(metadata?: ActiveModelMetadata): void {
+    this._activeModelMetadata = metadata;
+    this.broadcastStatus();
+  }
+
   /**
    * Broadcast current daemon status to all connected open clients.
    */
   public broadcastStatus(): void {
     this.broadcast({
       type: 'DAEMON_STATUS',
+      payload: this.getDaemonStatusPayload()
+    });
+  }
+
+  /**
+   * Get comprehensive ModelStats across System 1 and System 2.
+   */
+  public getModelStats(): ModelStats {
+    let s1: ModelStats['systemOne'];
+    if (this.layaEngine && typeof (this.layaEngine as any).getModelStats === 'function') {
+      s1 = (this.layaEngine as any).getModelStats();
+    } else {
+      s1 = {
+        ...this._systemOneStats,
+        status: this.layaReady ? 'ready' : this._systemOneStats.status
+      };
+    }
+
+    return {
+      systemOne: s1,
+      systemTwo: {
+        modelName: this._selectedModel,
+        availableModels: this._availableModels,
+        status: this._systemTwoStatus,
+        vramUsageMb: this._systemTwoVramMb,
+        gpuOffloaded: this._systemTwoGpuOffloaded,
+        error: this._systemTwoError
+      }
+    };
+  }
+
+  /**
+   * Broadcast MODEL_STATS payload to all connected open clients.
+   */
+  public broadcastModelStats(stats?: ModelStats): void {
+    const payload = stats ?? this.getModelStats();
+    this.broadcast({
+      type: 'MODEL_STATS',
+      payload
+    });
+  }
+
+  public broadcastNotification(level: 'info' | 'warning' | 'error', title: string, message: string): void {
+    this.broadcast({
+      type: 'DAEMON_NOTIFICATION',
       payload: {
-        isRunning: this.isRunning,
-        layaReady: this.layaReady,
-        activeTaskId: this.activeTaskId
+        level,
+        title,
+        message,
+        timestamp: Date.now()
       }
     });
+  }
+
+  public async broadcastGgufModels(): Promise<void> {
+    try {
+      const telemetry = await llamaEngine.getTelemetry();
+      const models = llamaEngine.getModelsList();
+      this.broadcast({
+        type: 'GGUF_MODELS_LIST',
+        payload: {
+          models,
+          activeModelId: llamaEngine.getActiveModelId(),
+          gpuName: telemetry.gpuName,
+          gpuBackend: telemetry.gpuBackend,
+          vramUsageMb: telemetry.vramUsageMb,
+          totalVramMb: telemetry.totalVramMb
+        }
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  public setSystemOneStats(stats: Partial<ModelStats['systemOne']>): void {
+    this._systemOneStats = { ...this._systemOneStats, ...stats };
+    if (stats.status === 'ready') {
+      this.layaReady = true;
+    } else if (stats.status === 'error' || stats.status === 'idle') {
+      this.layaReady = false;
+    }
+    this.broadcastStatus();
+    this.broadcastModelStats();
+  }
+
+  public setSystemTwoStats(stats: {
+    status?: ModelLoadingStatus;
+    modelName?: string;
+    vramUsageMb?: number;
+    gpuOffloaded?: boolean;
+    error?: string;
+    availableModels?: string[];
+  }): void {
+    if (stats.status !== undefined) this._systemTwoStatus = stats.status;
+    if (stats.modelName !== undefined) this._selectedModel = stats.modelName;
+    if (stats.vramUsageMb !== undefined) this._systemTwoVramMb = stats.vramUsageMb;
+    if (stats.gpuOffloaded !== undefined) this._systemTwoGpuOffloaded = stats.gpuOffloaded;
+    if (stats.error !== undefined) this._systemTwoError = stats.error;
+    if (stats.availableModels !== undefined) this._availableModels = stats.availableModels;
+    this.broadcastStatus();
+    this.broadcastModelStats();
+  }
+
+  public setSelectedModel(model: string): void {
+    this._selectedModel = model;
+    this.broadcastModelStats();
+  }
+
+  /**
+   * Set Laya engine ready state and broadcast status update.
+   */
+  public setLayaReady(ready: boolean): void {
+    this.layaReady = ready;
+    this._systemOneStats.status = ready ? 'ready' : 'idle';
+    this.broadcastStatus();
+    this.broadcastModelStats();
+  }
+
+  /**
+   * Update internal status properties directly.
+   */
+  public setStatus(status: Partial<DaemonStatusPayload & { lastCheckpoint?: TaskCheckpoint }>): void {
+    if (status.isRunning !== undefined) this.isRunning = status.isRunning;
+    if (status.layaReady !== undefined) this.layaReady = status.layaReady;
+    if (status.activeTaskId !== undefined) this.activeTaskId = status.activeTaskId;
+    if (status.activeRunId !== undefined) this._activeRunId = status.activeRunId;
+    if (status.activeModel !== undefined) this._activeModelMetadata = status.activeModel;
+    if (status.lastCheckpoint !== undefined) this.lastKnownCheckpoint = status.lastCheckpoint;
+    this.broadcastStatus();
+  }
+
+  /**
+   * Get current daemon status.
+   */
+  public getStatus(): DaemonStatusPayload & { lastCheckpoint?: TaskCheckpoint } {
+    return this.getDaemonStatusPayload();
+  }
+
+  /**
+   * Inject or update LayaEngine instance.
+   */
+  public setLayaEngine(engine: LayaEngine): void {
+    this.layaEngine = engine;
+    this._systemMonitor.setLayaEngine(engine);
+    if (typeof (engine as any).on === 'function') {
+      (engine as any).on('status_change', () => {
+        this.broadcastStatus();
+        this.broadcastModelStats();
+      });
+    }
+    this.setLayaReady(engine.isReady);
   }
 
   /**
@@ -972,45 +1553,7 @@ export class ScoutWsServer extends EventEmitter {
     }
   }
 
-  /**
-   * Set Laya engine ready state and broadcast status update.
-   */
-  public setLayaReady(ready: boolean): void {
-    this.layaReady = ready;
-    this.broadcastStatus();
-  }
 
-  /**
-   * Update internal status properties directly.
-   */
-  public setStatus(status: Partial<DaemonStatusPayload>): void {
-    if (status.isRunning !== undefined) this.isRunning = status.isRunning;
-    if (status.layaReady !== undefined) this.layaReady = status.layaReady;
-    if (status.activeTaskId !== undefined) this.activeTaskId = status.activeTaskId;
-    if (status.activeRunId !== undefined) this._activeRunId = status.activeRunId;
-    this.broadcastStatus();
-  }
-
-  /**
-   * Get current daemon status.
-   */
-  public getStatus(): DaemonStatusPayload {
-    return {
-      isRunning: this.isRunning,
-      layaReady: this.layaReady,
-      activeTaskId: this.activeTaskId,
-      activeRunId: this._activeRunId
-    };
-  }
-
-  /**
-   * Inject or update LayaEngine instance.
-   */
-  public setLayaEngine(engine: LayaEngine): void {
-    this.layaEngine = engine;
-    this._systemMonitor.setLayaEngine(engine);
-    this.setLayaReady(engine.isReady);
-  }
 
   /**
    * Inject or update BrowserRunner instance.
@@ -1090,6 +1633,7 @@ export class ScoutWsServer extends EventEmitter {
       return;
     }
     this.isClosed = true;
+    this._isStopping = false;
 
     this._systemMonitor.stop();
     this._scheduler.stop();

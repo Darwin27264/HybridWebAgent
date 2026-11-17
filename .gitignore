@@ -1,6 +1,42 @@
+# Dependencies
 node_modules/
+.pnpm-store/
+
+# Build outputs
 dist/
+build/
 .vite/
 *.tsbuildinfo
 .turbo/
 coverage/
+
+# Environment and secrets
+.env
+.env.*
+*.env
+*.pem
+*.key
+
+# Local SQLite databases and caches
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local model weights and downloads (downloaded on demand via model hub)
+*.gguf
+packages/daemon/models/*.gguf
+!packages/daemon/models/.gitkeep
+
+# System and editor files
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Scraped local run outputs
+results.md

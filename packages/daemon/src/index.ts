@@ -9,6 +9,7 @@ import { SystemMonitor } from './engine/systemMonitor.js';
 import { ResultsStore, resolveResultsPath } from './resultsStore.js';
 import type { TaskMetadata, ResultsStoreOptions } from './resultsStore.js';
 import type { ScoutDaemonOptions } from './types.js';
+import { llamaEngine } from './engine/llamaEngine.js';
 
 export { ScoutDatabase } from './db.js';
 export { ScoutWsServer } from './wsServer.js';
@@ -18,19 +19,47 @@ export {
   computeResultStats,
   generateResultsSummary,
   queryResults,
-  steerTask
+  steerTask,
+  evaluateStagnation
 } from './engine/systemTwoAssistant.js';
-export { LayaEngine, sanitizeStateSnippet, evaluateAlertRule } from './engine/layaEngine.js';
+export {
+  HARDWARE_LADDERS,
+  getProviderLadder,
+  getDeviceNameForProvider,
+  instantiateLayaSession,
+  probeLayaSession,
+  LayaEngine,
+  sanitizeStateSnippet,
+  mapQuestionsToLaya,
+  evaluateAlertRule,
+  type LayaEngineInitOptions
+} from './engine/layaEngine.js';
 export {
   compileTask,
   sanitizeCompiledSpec,
   getPresetTaskSpec,
   fetchOllamaModels,
+  fetchOllamaPs,
+  getSystemTwoModelStats,
+  resolveOllamaTimeout,
+  DEFAULT_OLLAMA_TIMEOUT_MS,
+  SYSTEM_TWO_LARGER_MODELS,
   DEFAULT_OLLAMA_MODELS,
   SELECTOR_PRESETS,
-  estimateTokens
+  estimateTokens,
+  type OllamaRunningModel,
+  type OllamaProcessStatus
 } from './engine/compiler.js';
 export { BrowserRunner, LruDeduplicator, sha1Hash, abortableSleep } from './runner/browserRunner.js';
+export {
+  LoopDetector,
+  isAtBottomOfPage,
+  isScrollStatic,
+  type LoopDetectorOptions,
+  type CycleTelemetry,
+  type LoopDetectionResult,
+  type StuckReason
+} from './runner/loopDetector.js';
 export { JobScheduler, parseCronField, matchesCron, calculateNextRun } from './scheduler.js';
 export { SystemMonitor } from './engine/systemMonitor.js';
 export * from './types.js';
@@ -83,6 +112,29 @@ export class ScoutDaemon {
   public async start(): Promise<void> {
     await this.wsServer.waitForReady();
 
+    // Auto-load downloaded GGUF model if available and not yet loaded
+    try {
+      if (!llamaEngine.isReady()) {
+        const downloadedModel = llamaEngine.getModelsList().find((m) => m.downloaded);
+        if (downloadedModel) {
+          console.log(`[Scout Daemon] Found downloaded GGUF model "${downloadedModel.id}". Mounting on GPU...`);
+          await llamaEngine.loadModel(downloadedModel.id);
+          this.wsServer.setSelectedModel(downloadedModel.id);
+          const telemetry = await llamaEngine.getTelemetry();
+          this.wsServer.setSystemTwoStats({
+            status: 'ready',
+            modelName: downloadedModel.id,
+            vramUsageMb: telemetry.vramUsageMb,
+            gpuOffloaded: telemetry.gpuOffloaded
+          });
+          await this.wsServer.broadcastGgufModels();
+          console.log(`[Scout Daemon] System 2 active on GPU (${telemetry.gpuName}, ${telemetry.gpuBackend}).`);
+        }
+      }
+    } catch (err: any) {
+      console.warn('[Scout Daemon] GGUF auto-load notice:', err.message);
+    }
+
     if (this.autoInitLaya) {
       this.layaEngine
         .initialize()
@@ -123,6 +175,12 @@ export class ScoutDaemon {
       this.db.close();
     } catch (err) {
       console.error('[Scout Daemon] Error closing database:', err);
+    }
+
+    try {
+      await llamaEngine.unloadModel();
+    } catch (err) {
+      console.error('[Scout Daemon] Error unloading Llama model:', err);
     }
   }
 }

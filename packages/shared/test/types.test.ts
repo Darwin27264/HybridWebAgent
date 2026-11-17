@@ -16,6 +16,11 @@ import type {
   ModelStats,
   ScrapedItem,
   ResultStats,
+  InteractiveInputElement,
+  NavigationChoice,
+  HandoverTriggerReason,
+  TaskCheckpoint,
+  AgentAction,
 } from '../src/index.js';
 
 console.log('Verifying @ofln-scout/shared type contracts...');
@@ -146,13 +151,19 @@ const steeringActions: SystemTwoSteeringAction[] = [
   { action: 'navigate', url: 'https://news.ycombinator.com/news?p=2' },
   { action: 'switch_tab', tabIndex: 1, url: 'https://news.ycombinator.com' },
   { action: 'adjust_strategy', newSelector: 'tr.athing', scrollStepPx: 500 },
+  { action: 'adjust_selector', selector: 'div.item' },
+  { action: 'retry_with_scroll', scrollStepPx: 800 },
+  { action: 'complete', message: 'Target alerts acquired' },
   { action: 'terminate', reason: 'goal_completed', message: 'All target items gathered' },
 ];
-assert.equal(steeringActions.length, 5);
+assert.equal(steeringActions.length, 8);
 assert.equal(steeringActions[0].action, 'paginate');
-assert.equal(steeringActions[4].action, 'terminate');
-if (steeringActions[4].action === 'terminate') {
-  assert.equal(steeringActions[4].reason, 'goal_completed');
+assert.equal(steeringActions[4].action, 'adjust_selector');
+assert.equal(steeringActions[5].action, 'retry_with_scroll');
+assert.equal(steeringActions[6].action, 'complete');
+assert.equal(steeringActions[7].action, 'terminate');
+if (steeringActions[7].action === 'terminate') {
+  assert.equal(steeringActions[7].reason, 'goal_completed');
 }
 
 // Test 12: HandoverContext
@@ -287,5 +298,193 @@ assert.equal(extendedServerMsgs[0].type, 'QUERY_RESULTS_RESPONSE');
 assert.equal(extendedServerMsgs[1].type, 'STEER_TASK_RESPONSE');
 assert.equal(extendedServerMsgs[2].type, 'RESULTS_UPDATE');
 assert.equal(extendedServerMsgs[3].type, 'MODEL_STATS');
+
+// Test 19: InteractiveInputElement and NavigationChoice
+const formInput: InteractiveInputElement = {
+  selector: 'input#search-box',
+  tag: 'input',
+  type: 'search',
+  name: 'q',
+  placeholder: 'Search Show HN...',
+  ariaLabel: 'Search',
+  formAction: '/search',
+  value: '',
+};
+assert.equal(formInput.selector, 'input#search-box');
+assert.equal(formInput.tag, 'input');
+assert.equal(formInput.type, 'search');
+assert.equal(formInput.name, 'q');
+assert.equal(formInput.placeholder, 'Search Show HN...');
+assert.equal(formInput.ariaLabel, 'Search');
+assert.equal(formInput.formAction, '/search');
+
+const navChoice: NavigationChoice = {
+  selector: 'nav a.active',
+  text: 'Past Submissions',
+  href: '/past',
+  category: 'archive',
+};
+assert.equal(navChoice.selector, 'nav a.active');
+assert.equal(navChoice.text, 'Past Submissions');
+assert.equal(navChoice.href, '/past');
+assert.equal(navChoice.category, 'archive');
+
+// Test 20: HandoverTriggerReason
+const reasons: HandoverTriggerReason[] = [
+  'stagnation',
+  'form_input_required',
+  'navigation_fork',
+  'stalled_progress',
+];
+assert.equal(reasons.length, 4);
+assert.deepEqual(reasons, ['stagnation', 'form_input_required', 'navigation_fork', 'stalled_progress']);
+
+// Test 21: AgentAction with 'interaction'
+const interactionAction: AgentAction = {
+  id: 'act-interact-001',
+  taskId: spec.id,
+  timestamp: Date.now(),
+  type: 'interaction',
+  status: 'success',
+  message: 'Filled input#search-box with "local AI"',
+  details: { selector: 'input#search-box', value: 'local AI' },
+};
+assert.equal(interactionAction.type, 'interaction');
+assert.equal(interactionAction.status, 'success');
+assert.equal(interactionAction.details?.value, 'local AI');
+
+// Test 22: Extended SystemTwoSteeringAction (form_input and choose_navigation)
+const extendedSteeringActions: SystemTwoSteeringAction[] = [
+  {
+    action: 'form_input',
+    selector: 'input#search-box',
+    text: 'local offline models',
+    submitSelector: 'button#submit-btn',
+    pressEnter: true,
+    reasoning: 'Need to enter query into search bar to locate offline model threads',
+  },
+  {
+    action: 'choose_navigation',
+    selector: 'a.category-link',
+    url: 'https://news.ycombinator.com/show',
+    text: 'Show HN',
+    reasoning: 'Goal requires Show HN submissions',
+  },
+];
+assert.equal(extendedSteeringActions.length, 2);
+assert.equal(extendedSteeringActions[0].action, 'form_input');
+if (extendedSteeringActions[0].action === 'form_input') {
+  assert.equal(extendedSteeringActions[0].text, 'local offline models');
+  assert.equal(extendedSteeringActions[0].pressEnter, true);
+  assert.equal(extendedSteeringActions[0].submitSelector, 'button#submit-btn');
+}
+assert.equal(extendedSteeringActions[1].action, 'choose_navigation');
+if (extendedSteeringActions[1].action === 'choose_navigation') {
+  assert.equal(extendedSteeringActions[1].url, 'https://news.ycombinator.com/show');
+  assert.equal(extendedSteeringActions[1].text, 'Show HN');
+}
+
+// Test 23: Extended HandoverContext with collaborative browsing fields
+const collaborativeContext: HandoverContext = {
+  taskId: 'task-test-02',
+  runId: 'run-test-02',
+  userGoal: 'Search and inspect AI repos',
+  targetUrl: 'https://news.ycombinator.com',
+  currentUrl: 'https://news.ycombinator.com',
+  pageTitle: 'Hacker News Portal',
+  triggerReason: 'form_input_required',
+  stuckReason: 'no_new_items',
+  scrollState: {
+    y: 0,
+    scrollHeight: 1000,
+    viewportHeight: 800,
+  },
+  totalScanned: 0,
+  totalAlerts: 0,
+  consecutiveEmptyCycles: 1,
+  formInputs: [formInput],
+  navigationChoices: [navChoice],
+  recentActions: ['Opened portal page', 'Detected search form'],
+};
+assert.equal(collaborativeContext.triggerReason, 'form_input_required');
+assert.equal(collaborativeContext.formInputs?.length, 1);
+assert.equal(collaborativeContext.navigationChoices?.length, 1);
+assert.equal(collaborativeContext.recentActions?.length, 2);
+
+// Test 24: TaskCheckpoint interface
+const checkpoint: TaskCheckpoint = {
+  id: 'chk-1731360000000-abc123',
+  taskId: spec.id,
+  runId: 'run-test-01',
+  createdAt: 1731360000000,
+  updatedAt: 1731360050000,
+  status: 'paused',
+  targetUrl: spec.targetUrl,
+  currentUrl: 'https://news.ycombinator.com/show?p=2',
+  pageTitle: 'Show HN - Page 2',
+  scroll: {
+    y: 1200,
+    scrollHeight: 3600,
+    viewportHeight: 900,
+  },
+  totalScanned: 45,
+  totalAlerts: 4,
+  activeStepCount: 15,
+  dedupHashes: ['hash1', 'hash2', 'hash3'],
+  modelConfig: {
+    systemOneModel: 'modernbert-onnx-fp32',
+    systemTwoModel: 'qwen2.5:3b',
+  },
+  wizardState: {
+    currentPage: 3,
+    userGoal: spec.userGoal,
+  },
+  chatContext: [
+    { role: 'user', text: 'Focus on local LLMs', timestamp: 1731360010000 },
+    { role: 'assistant', text: 'Understood, scanning for local models.', timestamp: 1731360015000 },
+  ],
+};
+assert.equal(checkpoint.id, 'chk-1731360000000-abc123');
+assert.equal(checkpoint.status, 'paused');
+assert.equal(checkpoint.scroll.y, 1200);
+assert.equal(checkpoint.dedupHashes.length, 3);
+assert.equal(checkpoint.modelConfig?.systemTwoModel, 'qwen2.5:3b');
+assert.equal(checkpoint.wizardState?.currentPage, 3);
+assert.equal(checkpoint.chatContext?.length, 2);
+
+// Test 25: WsClientToServerMessage checkpoint extensions
+const checkpointClientMsgs: WsClientToServerMessage[] = [
+  { type: 'RESUME_TASK', payload: { taskId: spec.id, checkpointId: checkpoint.id } },
+  { type: 'GET_CHECKPOINTS', payload: { taskId: spec.id } },
+];
+assert.equal(checkpointClientMsgs.length, 2);
+assert.equal(checkpointClientMsgs[0].type, 'RESUME_TASK');
+if (checkpointClientMsgs[0].type === 'RESUME_TASK') {
+  assert.equal(checkpointClientMsgs[0].payload.taskId, spec.id);
+  assert.equal(checkpointClientMsgs[0].payload.checkpointId, checkpoint.id);
+}
+assert.equal(checkpointClientMsgs[1].type, 'GET_CHECKPOINTS');
+
+// Test 26: WsServerToClientMessage checkpoint extensions
+const checkpointServerMsgs: WsServerToClientMessage[] = [
+  {
+    type: 'DAEMON_STATUS',
+    payload: {
+      isRunning: false,
+      layaReady: true,
+      activeTaskId: spec.id,
+      lastCheckpoint: checkpoint,
+    },
+  },
+  { type: 'CHECKPOINT_SAVED', payload: checkpoint },
+  { type: 'CHECKPOINTS_LIST', payload: [checkpoint] },
+];
+assert.equal(checkpointServerMsgs.length, 3);
+assert.equal(checkpointServerMsgs[0].type, 'DAEMON_STATUS');
+if (checkpointServerMsgs[0].type === 'DAEMON_STATUS') {
+  assert.equal(checkpointServerMsgs[0].payload.lastCheckpoint?.id, checkpoint.id);
+}
+assert.equal(checkpointServerMsgs[1].type, 'CHECKPOINT_SAVED');
+assert.equal(checkpointServerMsgs[2].type, 'CHECKPOINTS_LIST');
 
 console.log('✓ All @ofln-scout/shared type contracts verified successfully.');

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { useScoutStore, formatLatency } from './useScoutStore';
+import { formatItemAsCsvRow, formatResultsAsCsv } from '../components/ResultsPanel';
+import { wsClient } from '../lib/wsClient';
 import type {
   CompiledTaskSpec,
   InferenceTelemetryItem,
@@ -7,9 +9,13 @@ import type {
   AgentAction,
   BrowserSnapshot,
   SystemPerformanceMetrics,
+  ScrapedItem,
+  ResultStats,
+  ModelStats,
+  TaskCheckpoint,
 } from '@ofln-scout/shared';
 
-function runTests() {
+async function runTests() {
   console.log('▶ Starting useScoutStore unit tests...');
 
   // Reset store before starting
@@ -34,6 +40,14 @@ function runTests() {
     assert.equal(state.metrics, null, 'Expected metrics null initially');
     assert.equal(state.telemetryStats.totalScanned, 0, 'Expected totalScanned 0 initially');
     assert.equal(state.telemetryStats.avgLatencyMs, 0, 'Expected avgLatencyMs 0 initially');
+    assert.equal(state.resultsMarkdown, '', 'Expected resultsMarkdown empty initially');
+    assert.equal(state.resultsSummary, '', 'Expected resultsSummary empty initially');
+    assert.equal(state.resultsStats, null, 'Expected resultsStats null initially');
+    assert.equal(state.resultsItems.length, 0, 'Expected resultsItems empty initially');
+    assert.equal(state.resultsLastUpdated, null, 'Expected resultsLastUpdated null initially');
+    assert.equal(state.chatMessages.length, 0, 'Expected chatMessages empty initially');
+    assert.equal(state.isChatLoading, false, 'Expected isChatLoading false initially');
+    assert.equal(state.modelStats, null, 'Expected modelStats null initially');
     console.log('  ✔ Test 1: Initial store state verified');
   }
 
@@ -488,6 +502,14 @@ function runTests() {
     assert.equal(finalState.telemetryStats.avgLatencyMs, 0);
     assert.equal(finalState.isLaunching, false);
     assert.equal(finalState.isStopping, false);
+    assert.equal(finalState.resultsMarkdown, '');
+    assert.equal(finalState.resultsSummary, '');
+    assert.equal(finalState.resultsStats, null);
+    assert.equal(finalState.resultsItems.length, 0);
+    assert.equal(finalState.resultsLastUpdated, null);
+    assert.equal(finalState.chatMessages.length, 0);
+    assert.equal(finalState.isChatLoading, false);
+    assert.equal(finalState.modelStats, null);
     console.log('  ✔ Test 15: Full store reset verified');
   }
 
@@ -582,7 +604,569 @@ function runTests() {
     console.log('  ✔ Test 16: Defect remediations (null latency, activeJobId fallback, model sanitization) verified');
   }
 
+  // Test 17: Results state updates and stats aggregation
+  {
+    useScoutStore.getState().reset();
+
+    const sampleItems: ScrapedItem[] = [
+      {
+        id: 'item-1',
+        timestamp: new Date().toISOString(),
+        text: 'Show HN: Local ONNX Classifier',
+        link: 'https://news.ycombinator.com/item?id=1',
+        answers: { topic: 'local_ai' },
+        confidence: 0.95,
+        triggeredAlert: true,
+      },
+      {
+        id: 'item-2',
+        timestamp: new Date().toISOString(),
+        text: 'Ask HN: Favorite Web Dev Stack in 2026',
+        link: 'https://news.ycombinator.com/item?id=2',
+        answers: { topic: 'web_dev' },
+        confidence: 0.88,
+        triggeredAlert: false,
+      },
+    ];
+
+    const sampleStats: ResultStats = {
+      totalScanned: 25,
+      totalAlerts: 4,
+      matchRatePercent: 16.0,
+      avgLatencyMs: 42.5,
+      topCategories: { local_ai: 4, web_dev: 12, other: 9 },
+    };
+
+    useScoutStore.getState().setResults({
+      markdown: '# Test Report\n\n- Finding 1\n- Finding 2',
+      summary: 'System 2 identified 4 local AI releases.',
+      stats: sampleStats,
+      items: sampleItems,
+      timestamp: '2026-11-14T00:30:00.000Z',
+    });
+
+    const state = useScoutStore.getState();
+    assert.equal(state.resultsMarkdown, '# Test Report\n\n- Finding 1\n- Finding 2');
+    assert.equal(state.resultsSummary, 'System 2 identified 4 local AI releases.');
+    assert.equal(state.resultsStats?.totalScanned, 25);
+    assert.equal(state.resultsStats?.totalAlerts, 4);
+    assert.equal(state.resultsStats?.matchRatePercent, 16.0);
+    assert.equal(state.resultsStats?.topCategories.local_ai, 4);
+    assert.equal(state.resultsItems.length, 2);
+    assert.equal(state.resultsItems[0].id, 'item-1');
+    assert.equal(state.resultsLastUpdated, new Date('2026-11-14T00:30:00.000Z').getTime());
+
+    // Partial update: updating only markdown preserves summary, stats, and items
+    useScoutStore.getState().setResults({ markdown: '# Updated Report' });
+    const updatedState = useScoutStore.getState();
+    assert.equal(updatedState.resultsMarkdown, '# Updated Report');
+    assert.equal(updatedState.resultsSummary, 'System 2 identified 4 local AI releases.');
+    assert.equal(updatedState.resultsStats?.totalScanned, 25);
+    assert.equal(updatedState.resultsItems.length, 2);
+
+    console.log('  ✔ Test 17: Results state updates and partial updates verified');
+  }
+
+  // Test 18: Chat message appending, loading flag toggle, and clear action
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().chatMessages.length, 0);
+    assert.equal(useScoutStore.getState().isChatLoading, false);
+
+    // Add User Query
+    useScoutStore.getState().addChatMessage({
+      id: 'msg-u1',
+      role: 'user',
+      type: 'query',
+      content: 'Summarize top findings',
+      timestamp: Date.now(),
+    });
+    useScoutStore.getState().setChatLoading(true);
+
+    let state = useScoutStore.getState();
+    assert.equal(state.chatMessages.length, 1);
+    assert.equal(state.chatMessages[0].role, 'user');
+    assert.equal(state.chatMessages[0].type, 'query');
+    assert.equal(state.chatMessages[0].content, 'Summarize top findings');
+    assert.equal(state.isChatLoading, true);
+
+    // Add Assistant Response
+    useScoutStore.getState().addChatMessage({
+      id: 'msg-a1',
+      role: 'assistant',
+      type: 'query',
+      content: 'Here are the top findings: ...',
+      timestamp: Date.now(),
+      meta: { model: 'qwen2.5:7b-instruct-q4_K_M' },
+    });
+    useScoutStore.getState().setChatLoading(false);
+
+    state = useScoutStore.getState();
+    assert.equal(state.chatMessages.length, 2);
+    assert.equal(state.chatMessages[1].role, 'assistant');
+    assert.equal(state.chatMessages[1].meta?.model, 'qwen2.5:7b-instruct-q4_K_M');
+    assert.equal(state.isChatLoading, false);
+
+    // Add Steering Directive
+    useScoutStore.getState().addChatMessage({
+      id: 'msg-u2',
+      role: 'user',
+      type: 'steer',
+      content: 'Scroll faster (+200px)',
+      timestamp: Date.now(),
+    });
+    useScoutStore.getState().addChatMessage({
+      id: 'msg-a2',
+      role: 'assistant',
+      type: 'steer',
+      content: 'Increased scroll step to 500px.',
+      timestamp: Date.now(),
+      meta: { applied: true, explanation: 'Updated scrollStepPx to 500' },
+    });
+
+    state = useScoutStore.getState();
+    assert.equal(state.chatMessages.length, 4);
+    assert.equal(state.chatMessages[3].meta?.applied, true);
+
+    // Clear messages
+    useScoutStore.getState().clearChatMessages();
+    assert.equal(useScoutStore.getState().chatMessages.length, 0);
+
+    console.log('  ✔ Test 18: Chat message stream, steering meta, and clearing verified');
+  }
+
+  // Test 19: Model stats lifecycle state updates
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().modelStats, null);
+
+    const sampleModelStats: ModelStats = {
+      systemOne: {
+        modelName: 'modernbert-onnx-int8',
+        format: 'int8',
+        provider: 'dml',
+        device: 'DirectML (Intel Iris Xe)',
+        status: 'ready',
+        avgLatencyMs: 14.8,
+      },
+      systemTwo: {
+        modelName: 'qwen2.5:7b-instruct-q4_K_M',
+        availableModels: ['qwen2.5:7b-instruct-q4_K_M', 'llama3.2:3b'],
+        status: 'ready',
+        vramUsageMb: 4250,
+        gpuOffloaded: true,
+      },
+    };
+
+    useScoutStore.getState().setModelStats(sampleModelStats);
+    const state = useScoutStore.getState();
+    assert.notEqual(state.modelStats, null);
+    assert.equal(state.modelStats?.systemOne.modelName, 'modernbert-onnx-int8');
+    assert.equal(state.modelStats?.systemOne.format, 'int8');
+    assert.equal(state.modelStats?.systemOne.provider, 'dml');
+    assert.equal(state.modelStats?.systemOne.status, 'ready');
+    assert.equal(state.modelStats?.systemOne.avgLatencyMs, 14.8);
+    assert.equal(state.modelStats?.systemTwo.modelName, 'qwen2.5:7b-instruct-q4_K_M');
+    assert.equal(state.modelStats?.systemTwo.status, 'ready');
+    assert.equal(state.modelStats?.systemTwo.vramUsageMb, 4250);
+    assert.equal(state.modelStats?.systemTwo.gpuOffloaded, true);
+
+    // Update with loading / error status
+    useScoutStore.getState().setModelStats({
+      ...sampleModelStats,
+      systemTwo: {
+        ...sampleModelStats.systemTwo,
+        status: 'loading',
+      },
+    });
+    assert.equal(useScoutStore.getState().modelStats?.systemTwo.status, 'loading');
+
+    console.log('  ✔ Test 19: Dual-brain model stats and lifecycle transitions verified');
+  }
+
+  // Test 20: Tab navigation to results tab
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().activeTab, 'workbench');
+
+    useScoutStore.getState().setActiveTab('results');
+    assert.equal(useScoutStore.getState().activeTab, 'results');
+
+    useScoutStore.getState().setActiveTab('jobs');
+    assert.equal(useScoutStore.getState().activeTab, 'jobs');
+
+    useScoutStore.getState().setActiveTab('status');
+    assert.equal(useScoutStore.getState().activeTab, 'status');
+
+    useScoutStore.getState().setActiveTab('workbench');
+    assert.equal(useScoutStore.getState().activeTab, 'workbench');
+
+    console.log('  ✔ Test 20: Tab navigation to results and other tabs verified');
+  }
+
+  // Test 21: Fresh run execution reset and store reset verification
+  {
+    useScoutStore.getState().reset();
+
+    // Populate transient data across feeds, actions, results, and chat
+    useScoutStore.getState().addInference({
+      id: 'inf-fresh-1',
+      taskId: 't-1',
+      timestamp: Date.now(),
+      domSnippet: 'sample',
+      latencyMs: 20,
+      rawAnswers: {},
+      triggeredAlert: true,
+    });
+    useScoutStore.getState().addAction({
+      id: 'act-fresh-1',
+      taskId: 't-1',
+      timestamp: Date.now(),
+      type: 'stagnation_detected',
+      status: 'warning',
+      message: 'Browser crawler stagnant at bottom of page',
+      details: { stuckReason: 'page_bottom', consecutiveEmptyCycles: 3 },
+    });
+    useScoutStore.getState().setResults({
+      markdown: '# Run 1 Results',
+      summary: 'Run 1 summary',
+      items: [{ id: 'i-1', text: 't1', answers: {}, confidence: 0.9, triggeredAlert: false, timestamp: '' }],
+    });
+    useScoutStore.getState().addChatMessage({
+      id: 'c-1',
+      role: 'user',
+      type: 'query',
+      content: 'hello',
+      timestamp: Date.now(),
+    });
+
+    assert.equal(useScoutStore.getState().inferenceFeed.length, 1);
+    assert.equal(useScoutStore.getState().agentActions.length, 1);
+    assert.equal(useScoutStore.getState().resultsItems.length, 1);
+    assert.equal(useScoutStore.getState().chatMessages.length, 1);
+
+    // Call startFreshRun()
+    useScoutStore.getState().startFreshRun();
+    const freshState = useScoutStore.getState();
+    assert.equal(freshState.inferenceFeed.length, 0);
+    assert.equal(freshState.alerts.length, 0);
+    assert.equal(freshState.agentActions.length, 0);
+    assert.equal(freshState.resultsMarkdown, '');
+    assert.equal(freshState.resultsSummary, '');
+    assert.equal(freshState.resultsStats, null);
+    assert.equal(freshState.resultsItems.length, 0);
+    assert.equal(freshState.resultsLastUpdated, null);
+    assert.equal(freshState.chatMessages.length, 0);
+    assert.equal(freshState.isChatLoading, false);
+
+    console.log('  ✔ Test 21: Fresh run execution reset clears results and chat state verified');
+  }
+
+  // Test 22: Remediation - RFC 4180 CSV export escaping & chatLoading reset on disconnect/send failure
+  {
+    useScoutStore.getState().reset();
+
+    // 1. CSV export escaping for items containing URLs with commas and quotes (RFC 4180)
+    const complexItems: ScrapedItem[] = [
+      {
+        id: 'item-1',
+        timestamp: '2026-11-14T00:00:00.000Z',
+        triggeredAlert: false,
+        confidence: 0.9,
+        answers: { tag: 'ai,ml', rank: 1 },
+        link: 'https://example.com/search?q=ai,ml&sort=date,desc',
+        text: 'Valid snippet text with simple words',
+      },
+      {
+        id: 'item-"2",with,commas',
+        timestamp: '2026-11-14T00:01:00.000Z',
+        triggeredAlert: true,
+        confidence: 0.9876,
+        answers: { quote: 'He said "Hello, World!"', nested: { a: 'b,c' } },
+        link: 'https://maps.google.com/?ll=40.7128,-74.0060&query="New+York,NY"',
+        text: 'Snippet\nwith newline and "embedded quotes" and, commas, everywhere',
+      },
+      {
+        id: 'item-3-minimal',
+        timestamp: '2026-11-14T00:02:00.000Z',
+        triggeredAlert: false,
+        confidence: undefined as unknown as number,
+        answers: undefined as any,
+        link: undefined,
+        text: undefined as unknown as string,
+      },
+    ];
+
+    // Helper RFC 4180 CSV parser
+    const parseCsvRow = (row: string): string[] => {
+      const fields: string[] = [];
+      let current = '';
+      let inQuotes = false;
+      let i = 0;
+      while (i < row.length) {
+        const char = row[i];
+        if (inQuotes) {
+          if (char === '"') {
+            if (i + 1 < row.length && row[i + 1] === '"') {
+              current += '"';
+              i += 2;
+              continue;
+            } else {
+              inQuotes = false;
+              i++;
+              continue;
+            }
+          } else {
+            current += char;
+            i++;
+            continue;
+          }
+        } else {
+          if (char === '"') {
+            inQuotes = true;
+            i++;
+            continue;
+          } else if (char === ',') {
+            fields.push(current);
+            current = '';
+            i++;
+            continue;
+          } else {
+            current += char;
+            i++;
+            continue;
+          }
+        }
+      }
+      fields.push(current);
+      return fields;
+    };
+
+    const fullCsv = formatResultsAsCsv(complexItems);
+    const csvLines = fullCsv.split('\n');
+    assert.equal(csvLines.length, 4, 'Expected header + 3 data rows in CSV');
+
+    const headerCols = parseCsvRow(csvLines[0]);
+    assert.equal(headerCols.length, 7, 'Expected 7 header columns');
+    assert.deepEqual(headerCols, ['ID', 'Timestamp', 'TriggeredAlert', 'Confidence', 'Answers', 'Link', 'Snippet']);
+
+    for (let idx = 0; idx < complexItems.length; idx++) {
+      const item = complexItems[idx];
+      const rowStr = csvLines[idx + 1];
+      const rowFromFn = formatItemAsCsvRow(item);
+      assert.equal(rowStr, rowFromFn, 'formatResultsAsCsv row must match formatItemAsCsvRow');
+
+      // Assert strict 7-column parsing
+      const parsedFields = parseCsvRow(rowStr);
+      assert.equal(
+        parsedFields.length,
+        7,
+        `Expected exactly 7 columns in row ${idx + 1}, got ${parsedFields.length}. Row: ${rowStr}`
+      );
+
+      // Verify each column matches RFC 4180 unescaped values
+      assert.equal(parsedFields[0], item.id || '', 'ID column mismatch');
+      assert.equal(parsedFields[1], item.timestamp, 'Timestamp column mismatch');
+      assert.equal(parsedFields[2], item.triggeredAlert ? 'YES' : 'NO', 'TriggeredAlert column mismatch');
+      assert.equal(parsedFields[3], (item.confidence ?? 0).toFixed(2), 'Confidence column mismatch');
+      assert.deepEqual(JSON.parse(parsedFields[4]), item.answers || {}, 'Answers JSON mismatch');
+      assert.equal(parsedFields[5], item.link || '', 'Link column mismatch (commas or quotes corrupted)');
+      assert.equal(parsedFields[6], (item.text || '').replace(/\r?\n/g, ' '), 'Snippet column mismatch');
+
+      // Also verify regex-based comma splitting respecting quotes produces 7 columns
+      const regexSplit = rowStr.split(/,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)/);
+      assert.equal(regexSplit.length, 7, `Regex split on row ${idx + 1} did not yield 7 columns`);
+    }
+
+    // 2. Disconnect (`setConnected(false)`) resets `isChatLoading: false`
+    useScoutStore.getState().setConnected(true);
+    useScoutStore.getState().setChatLoading(true);
+    assert.equal(useScoutStore.getState().isChatLoading, true);
+
+    useScoutStore.getState().setConnected(false);
+    assert.equal(
+      useScoutStore.getState().isChatLoading,
+      false,
+      'Expected isChatLoading reset to false on disconnect'
+    );
+    assert.equal(useScoutStore.getState().wsConnected, false);
+
+    // 3. wsClient.send failure resets isChatLoading immediately
+    assert.equal(wsClient.isConnected(), false, 'Expected wsClient disconnected in test environment');
+
+    // queryResults while disconnected
+    const querySent = wsClient.queryResults('What is the summary of recent scans?');
+    assert.equal(querySent, false, 'Expected queryResults to return false when disconnected');
+    assert.equal(
+      useScoutStore.getState().isChatLoading,
+      false,
+      'Expected isChatLoading reset to false when queryResults send fails'
+    );
+
+    // steerTask while disconnected
+    const steerSent = wsClient.steerTask('Scroll 300px down');
+    assert.equal(steerSent, false, 'Expected steerTask to return false when disconnected');
+    assert.equal(
+      useScoutStore.getState().isChatLoading,
+      false,
+      'Expected isChatLoading reset to false when steerTask send fails'
+    );
+
+    console.log('  ✔ Test 22: RFC 4180 CSV export escaping and isChatLoading disconnect/failure reset verified');
+  }
+
+  // Test 23: Wizard navigation setPage sets page and clamps to [1, 4]
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().currentPage, 1, 'Initial page should be 1');
+
+    useScoutStore.getState().setPage(2);
+    assert.equal(useScoutStore.getState().currentPage, 2, 'Should advance to page 2');
+
+    useScoutStore.getState().setPage(3);
+    assert.equal(useScoutStore.getState().currentPage, 3, 'Should advance to page 3');
+
+    useScoutStore.getState().setPage(4);
+    assert.equal(useScoutStore.getState().currentPage, 4, 'Should advance to page 4');
+
+    // Clamping lower bound
+    useScoutStore.getState().setPage(0);
+    assert.equal(useScoutStore.getState().currentPage, 1, 'setPage(0) should clamp to 1');
+
+    useScoutStore.getState().setPage(-10);
+    assert.equal(useScoutStore.getState().currentPage, 1, 'setPage(-10) should clamp to 1');
+
+    // Clamping upper bound
+    useScoutStore.getState().setPage(5);
+    assert.equal(useScoutStore.getState().currentPage, 4, 'setPage(5) should clamp to 4');
+
+    useScoutStore.getState().setPage(99);
+    assert.equal(useScoutStore.getState().currentPage, 4, 'setPage(99) should clamp to 4');
+
+    console.log('  ✔ Test 23: Wizard navigation setPage and clamping to [1, 4] verified');
+  }
+
+  // Test 24: Wizard navigation nextPage increments up to 4
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().currentPage, 1);
+
+    useScoutStore.getState().nextPage();
+    assert.equal(useScoutStore.getState().currentPage, 2, 'nextPage() from 1 should yield 2');
+
+    useScoutStore.getState().nextPage();
+    assert.equal(useScoutStore.getState().currentPage, 3, 'nextPage() from 2 should yield 3');
+
+    useScoutStore.getState().nextPage();
+    assert.equal(useScoutStore.getState().currentPage, 4, 'nextPage() from 3 should yield 4');
+
+    // Clamped at 4
+    useScoutStore.getState().nextPage();
+    assert.equal(useScoutStore.getState().currentPage, 4, 'nextPage() from 4 should stay 4');
+
+    console.log('  ✔ Test 24: Wizard navigation nextPage up to 4 verified');
+  }
+
+  // Test 25: Wizard navigation prevPage decrements down to 1
+  {
+    useScoutStore.getState().reset();
+    useScoutStore.getState().setPage(4);
+    assert.equal(useScoutStore.getState().currentPage, 4);
+
+    useScoutStore.getState().prevPage();
+    assert.equal(useScoutStore.getState().currentPage, 3, 'prevPage() from 4 should yield 3');
+
+    useScoutStore.getState().prevPage();
+    assert.equal(useScoutStore.getState().currentPage, 2, 'prevPage() from 3 should yield 2');
+
+    useScoutStore.getState().prevPage();
+    assert.equal(useScoutStore.getState().currentPage, 1, 'prevPage() from 2 should yield 1');
+
+    // Clamped at 1
+    useScoutStore.getState().prevPage();
+    assert.equal(useScoutStore.getState().currentPage, 1, 'prevPage() from 1 should stay 1');
+
+    console.log('  ✔ Test 25: Wizard navigation prevPage down to 1 verified');
+  }
+
+  // Test 26: reset() resets currentPage to 1
+  {
+    useScoutStore.getState().reset();
+    useScoutStore.getState().setPage(3);
+    assert.equal(useScoutStore.getState().currentPage, 3);
+
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().currentPage, 1, 'reset() must reset currentPage to 1');
+    assert.equal(useScoutStore.getState().canResume, false, 'reset() must reset canResume to false');
+    assert.equal(useScoutStore.getState().lastCheckpoint, undefined, 'reset() must reset lastCheckpoint to undefined');
+
+    console.log('  ✔ Test 26: reset() resets currentPage to 1 verified');
+  }
+
+  // Test 27: lastCheckpoint and canResume state handling and resumeTask() transitions to Page 3
+  {
+    useScoutStore.getState().reset();
+    assert.equal(useScoutStore.getState().canResume, false);
+    assert.equal(useScoutStore.getState().lastCheckpoint, undefined);
+
+    const sampleCheckpoint: TaskCheckpoint = {
+      id: 'chk-test-001',
+      taskId: 'task-test-resume',
+      runId: 'run-resume-1',
+      createdAt: Date.now() - 5000,
+      updatedAt: Date.now(),
+      status: 'paused',
+      targetUrl: 'https://news.ycombinator.com',
+      currentUrl: 'https://news.ycombinator.com',
+      pageTitle: 'Hacker News',
+      scroll: { y: 300, scrollHeight: 2000, viewportHeight: 800 },
+      totalScanned: 15,
+      totalAlerts: 2,
+      activeStepCount: 5,
+      dedupHashes: ['h1', 'h2'],
+      wizardState: { currentPage: 3, userGoal: 'Monitor AI stories' },
+    };
+
+    // When status receives lastCheckpoint and isRunning is false -> canResume: true
+    useScoutStore.getState().setStatus({
+      isRunning: false,
+      layaReady: true,
+      activeTaskId: 'task-test-resume',
+      lastCheckpoint: sampleCheckpoint,
+    });
+    assert.equal(useScoutStore.getState().canResume, true, 'canResume should be true when lastCheckpoint present and idle');
+    assert.deepEqual(useScoutStore.getState().lastCheckpoint, sampleCheckpoint);
+
+    // When task starts running -> canResume: false
+    useScoutStore.getState().setStatus({
+      isRunning: true,
+      layaReady: true,
+      activeTaskId: 'task-test-resume',
+    });
+    assert.equal(useScoutStore.getState().canResume, false, 'canResume should be false while isRunning');
+
+    // When task stops again -> canResume: true
+    useScoutStore.getState().setStatus({
+      isRunning: false,
+      layaReady: true,
+      activeTaskId: null,
+    });
+    assert.equal(useScoutStore.getState().canResume, true, 'canResume should be true after stopping');
+
+    // Test resumeTask() transitions to Page 3
+    useScoutStore.getState().setPage(1);
+    assert.equal(useScoutStore.getState().currentPage, 1);
+
+    await useScoutStore.getState().resumeTask('task-test-resume', 'chk-test-001');
+    assert.equal(useScoutStore.getState().currentPage, 3, 'resumeTask() should set currentPage to 3');
+
+    console.log('  ✔ Test 27: lastCheckpoint and canResume handling and resumeTask() transitions to Page 3 verified');
+  }
+
   console.log('✅ All useScoutStore unit tests PASSED successfully!\n');
 }
 
-runTests();
+runTests().catch((err) => {
+  console.error('Fatal error in tests:', err);
+  process.exit(1);
+});

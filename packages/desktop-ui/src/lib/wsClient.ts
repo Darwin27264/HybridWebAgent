@@ -45,6 +45,8 @@ export class ScoutWsClient {
         this.getModels();
         this.getMetrics();
         this.getJobs();
+        this.getResults();
+        this.getModelStats();
       };
 
       this.ws.onclose = () => {
@@ -115,6 +117,55 @@ export class ScoutWsClient {
     switch (msg.type) {
       case 'DAEMON_STATUS':
         store.setStatus(msg.payload);
+        if (msg.payload.modelStats) {
+          store.setModelStats(msg.payload.modelStats);
+        }
+        break;
+
+      case 'CHECKPOINT_SAVED':
+        store.setLastCheckpoint(msg.payload);
+        break;
+
+      case 'RESULTS_UPDATE':
+        store.setResults(msg.payload);
+        break;
+
+      case 'QUERY_RESULTS_RESPONSE':
+        store.addChatMessage({
+          id: `query-resp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          role: 'assistant',
+          type: 'query',
+          content: msg.payload.answer,
+          timestamp: typeof msg.payload.timestamp === 'string' ? new Date(msg.payload.timestamp).getTime() : Date.now(),
+          meta: {
+            model: msg.payload.model,
+          },
+        });
+        store.setChatLoading(false);
+        break;
+
+      case 'STEER_TASK_RESPONSE':
+        store.addChatMessage({
+          id: `steer-resp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          role: 'assistant',
+          type: 'steer',
+          content: msg.payload.explanation,
+          timestamp: typeof msg.payload.timestamp === 'string' ? new Date(msg.payload.timestamp).getTime() : Date.now(),
+          meta: {
+            applied: msg.payload.applied,
+            explanation: msg.payload.explanation,
+          },
+        });
+        store.setChatLoading(false);
+        if (msg.payload.applied) {
+          toast.success(`Steer applied: ${msg.payload.instruction}`);
+        } else {
+          toast.warning(`Steer not applied: ${msg.payload.explanation}`);
+        }
+        break;
+
+      case 'MODEL_STATS':
+        store.setModelStats(msg.payload);
         break;
 
       case 'COMPILATION_PROGRESS':
@@ -153,6 +204,23 @@ export class ScoutWsClient {
           msg.payload.selectedModel,
           msg.payload.ollamaOnline
         );
+        break;
+
+      case 'GGUF_MODELS_LIST':
+        store.setGgufModelsList(msg.payload);
+        break;
+
+      case 'MODEL_DOWNLOAD_PROGRESS':
+        store.updateModelDownloadProgress(msg.payload);
+        if (msg.payload.status === 'completed') {
+          toast.success('Model Download Complete', {
+            description: `"${msg.payload.modelId}" is ready to load onto GPU.`
+          });
+        } else if (msg.payload.status === 'error') {
+          toast.error('Model Download Failed', {
+            description: msg.payload.error || 'Failed to download GGUF from Hugging Face'
+          });
+        }
         break;
 
       case 'METRICS_UPDATE':
@@ -216,6 +284,23 @@ export class ScoutWsClient {
     });
   }
 
+  public resumeTask(taskId?: string, checkpointId?: string): boolean {
+    const store = useScoutStore.getState();
+    const effectiveTaskId = taskId || store.lastCheckpoint?.taskId || store.daemonStatus.activeTaskId || '';
+    if (!effectiveTaskId) {
+      console.warn('[ScoutWsClient] Cannot resume task: no taskId provided');
+      return false;
+    }
+    useScoutStore.getState().setIsLaunching(true);
+    return this.send({
+      type: 'RESUME_TASK',
+      payload: {
+        taskId: effectiveTaskId,
+        checkpointId: checkpointId || store.lastCheckpoint?.id,
+      },
+    });
+  }
+
   public clearAlerts(): boolean {
     const ok = this.send({
       type: 'CLEAR_ALERTS',
@@ -229,6 +314,33 @@ export class ScoutWsClient {
   public getModels(): boolean {
     return this.send({
       type: 'GET_MODELS',
+    });
+  }
+
+  public getGgufModels(): boolean {
+    return this.send({
+      type: 'GET_GGUF_MODELS',
+    });
+  }
+
+  public downloadModel(modelId: string): boolean {
+    return this.send({
+      type: 'DOWNLOAD_MODEL',
+      payload: { modelId },
+    });
+  }
+
+  public cancelDownload(modelId: string): boolean {
+    return this.send({
+      type: 'CANCEL_DOWNLOAD',
+      payload: { modelId },
+    });
+  }
+
+  public loadModel(modelId: string): boolean {
+    return this.send({
+      type: 'LOAD_MODEL',
+      payload: { modelId },
     });
   }
 
@@ -299,6 +411,65 @@ export class ScoutWsClient {
     return this.send({
       type: 'STOP_JOB',
       payload: { jobId },
+    });
+  }
+
+  public getResults(taskId?: string): boolean {
+    return this.send({
+      type: 'GET_RESULTS',
+      payload: { taskId },
+    });
+  }
+
+  public queryResults(query: string, taskId?: string): boolean {
+    const trimmed = (query || '').trim();
+    if (!trimmed) return false;
+    const store = useScoutStore.getState();
+    store.addChatMessage({
+      id: `query-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      role: 'user',
+      type: 'query',
+      content: trimmed,
+      timestamp: Date.now(),
+    });
+    store.setChatLoading(true);
+    const sent = this.send({
+      type: 'QUERY_RESULTS',
+      payload: { query: trimmed, taskId },
+    });
+    if (!sent) {
+      store.setChatLoading(false);
+      return false;
+    }
+    return true;
+  }
+
+  public steerTask(instruction: string, taskId?: string): boolean {
+    const trimmed = (instruction || '').trim();
+    if (!trimmed) return false;
+    const store = useScoutStore.getState();
+    store.addChatMessage({
+      id: `steer-user-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      role: 'user',
+      type: 'steer',
+      content: trimmed,
+      timestamp: Date.now(),
+    });
+    store.setChatLoading(true);
+    const sent = this.send({
+      type: 'STEER_TASK',
+      payload: { instruction: trimmed, taskId },
+    });
+    if (!sent) {
+      store.setChatLoading(false);
+      return false;
+    }
+    return true;
+  }
+
+  public getModelStats(): boolean {
+    return this.send({
+      type: 'GET_MODEL_STATS',
     });
   }
 

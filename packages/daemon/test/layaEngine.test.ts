@@ -4,7 +4,10 @@ import {
   LayaEngine,
   sanitizeStateSnippet,
   mapQuestionsToLaya,
-  evaluateAlertRule
+  evaluateAlertRule,
+  HARDWARE_LADDERS,
+  getProviderLadder,
+  getDeviceNameForProvider
 } from '../src/engine/layaEngine.js';
 import type { CompiledTaskSpec, AlertRule } from '@ofln-scout/shared';
 
@@ -192,6 +195,62 @@ describe('System 1 Decision Engine (Unit & Integration)', () => {
           `Answer confidence for ${key} must be in [0, 1]`
         );
       }
+    });
+  });
+
+  describe('Milestone 2: Hardware Acceleration & Model Options', () => {
+    it('defines hardware acceleration ladders for win32, linux, and darwin', () => {
+      assert.deepEqual(HARDWARE_LADDERS.win32, ['webgpu', 'dml', 'cpu']);
+      assert.deepEqual(HARDWARE_LADDERS.linux, ['cuda', 'rocm', 'openvino', 'webgpu', 'cpu']);
+      assert.deepEqual(HARDWARE_LADDERS.darwin, ['webgpu', 'cpu']);
+
+      assert.deepEqual(getProviderLadder('win32'), ['webgpu', 'dml', 'cpu']);
+      assert.deepEqual(getProviderLadder('linux'), ['cuda', 'rocm', 'openvino', 'webgpu', 'cpu']);
+      assert.deepEqual(getProviderLadder('darwin'), ['webgpu', 'cpu']);
+      assert.deepEqual(getProviderLadder('unknown_os' as any), ['cuda', 'rocm', 'openvino', 'webgpu', 'cpu']);
+    });
+
+    it('maps execution providers to human-readable device strings', () => {
+      assert.equal(getDeviceNameForProvider('webgpu'), 'GPU (WebGPU Adapter)');
+      assert.equal(getDeviceNameForProvider('dml'), 'DirectML (DirectX 12 GPU)');
+      assert.equal(getDeviceNameForProvider('cuda'), 'NVIDIA GPU (CUDA)');
+      assert.equal(getDeviceNameForProvider('tensorrt'), 'NVIDIA TensorRT GPU');
+      assert.equal(getDeviceNameForProvider('rocm'), 'AMD GPU (ROCm)');
+      assert.equal(getDeviceNameForProvider('openvino'), 'Intel NPU/GPU (OpenVINO)');
+      assert.equal(getDeviceNameForProvider('cpu'), 'CPU');
+      assert.equal(getDeviceNameForProvider('other'), 'CPU');
+    });
+
+    it('exposes accurate ModelStats conforming to the shared contract', () => {
+      const stats = engine.getModelStats();
+      assert.ok(stats.modelName.includes('laya'));
+      assert.ok(stats.format === 'fp32' || stats.format === 'int8');
+      assert.ok(typeof stats.provider === 'string');
+      assert.ok(typeof stats.device === 'string');
+      assert.ok(stats.status === 'ready' || stats.status === 'idle');
+      assert.ok(typeof stats.avgLatencyMs === 'number');
+      assert.ok(stats.avgLatencyMs >= 0);
+    });
+
+    it('falls back cleanly to FP32 when INT8 model file is missing', async () => {
+      const tempEngine = new LayaEngine();
+      const ok = await tempEngine.initialize({ format: 'int8', forceOffline: false });
+      if (ok) {
+        assert.equal(tempEngine.format, 'fp32');
+        assert.equal(tempEngine.modelName, 'laya.onnx');
+        assert.equal(tempEngine.status, 'ready');
+      }
+      await tempEngine.close();
+    });
+
+    it('falls back to CPU or available provider when preferred provider fails probe pass', async () => {
+      const tempEngine = new LayaEngine();
+      const ok = await tempEngine.initialize({ preferredProvider: 'non_existent_gpu_provider' });
+      if (ok) {
+        assert.equal(tempEngine.status, 'ready');
+        assert.ok(['webgpu', 'dml', 'cpu'].includes(tempEngine.provider));
+      }
+      await tempEngine.close();
     });
   });
 });

@@ -29,7 +29,7 @@ export const LiveBrowserView: React.FC = () => {
   const scrollPercent = scroll ? Math.min(100, Math.max(0, Math.round((scroll.y / maxScroll) * 100))) : 0;
 
   return (
-    <div className="bg-[#242427] border border-[#383842] rounded-xl p-5 shadow-sm flex flex-col h-full min-h-[460px]">
+    <div className="bg-[#242427] border border-[#383842] rounded-xl p-5 shadow-sm flex flex-col h-full min-h-[580px] 2xl:min-h-[700px]">
       {/* Header with Title and Live Status Badge */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#383842] pb-3 mb-4">
         <div className="flex items-center gap-2">
@@ -90,7 +90,7 @@ export const LiveBrowserView: React.FC = () => {
       </div>
 
       {/* Snapshot Canvas Viewport */}
-      <div className="flex-1 min-h-[300px] bg-[#18181b] border border-[#383842] rounded-lg overflow-hidden flex flex-col items-center justify-center relative">
+      <div className="flex-1 min-h-[440px] 2xl:min-h-[560px] bg-[#18181b] border border-[#383842] rounded-lg overflow-hidden flex flex-col items-center justify-center relative">
         {screenshotSrc ? (
           <div className="w-full h-full overflow-auto flex flex-col items-center justify-start p-2">
             <img

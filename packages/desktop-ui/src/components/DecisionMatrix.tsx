@@ -15,7 +15,7 @@ export const DecisionMatrix: React.FC = () => {
   const daemonStatus = useScoutStore((state) => state.daemonStatus);
 
   return (
-    <div className="bg-[#242427] border border-[#383842] rounded-xl p-5 shadow-sm flex flex-col h-full min-h-[460px]">
+    <div className="bg-[#242427] border border-[#383842] rounded-xl p-5 shadow-sm flex flex-col h-full min-h-[580px] 2xl:min-h-[700px]">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-[#383842] pb-3 mb-4">
         <div className="flex items-center gap-2">

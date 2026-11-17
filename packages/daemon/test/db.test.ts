@@ -4,7 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { ScoutDatabase } from '../src/db.js';
-import type { CompiledTaskSpec, InferenceTelemetryItem } from '@ofln-scout/shared';
+import type {
+  CompiledTaskSpec,
+  InferenceTelemetryItem,
+  TaskCheckpoint,
+  AgentAction
+} from '@ofln-scout/shared';
 
 describe('ScoutDatabase (Unit & Integration)', () => {
   let db: ScoutDatabase;
@@ -270,6 +275,336 @@ describe('ScoutDatabase (Unit & Integration)', () => {
         fs.rmSync(tempDir, { recursive: true, force: true });
       } catch {
         // ignore cleanup error
+      }
+    }
+  });
+
+  // ===================== Checkpoint & Action Test Suites =====================
+
+  it('saves, retrieves, and updates task checkpoints (CRUD)', () => {
+    db.insertTask(mockSpec);
+
+    const chk: TaskCheckpoint = {
+      id: 'chk-001',
+      taskId: mockSpec.id,
+      runId: 'run-101',
+      createdAt: 1731360000000,
+      updatedAt: 1731360010000,
+      status: 'paused',
+      targetUrl: mockSpec.targetUrl,
+      currentUrl: 'https://news.ycombinator.com/item?id=123',
+      pageTitle: 'Item Detail',
+      scroll: {
+        y: 650,
+        scrollHeight: 2400,
+        viewportHeight: 800,
+      },
+      totalScanned: 25,
+      totalAlerts: 3,
+      activeStepCount: 8,
+      dedupHashes: ['hash-a', 'hash-b'],
+      modelConfig: {
+        systemOneModel: 'modernbert-onnx-fp32',
+        systemTwoModel: 'qwen2.5:3b',
+      },
+      wizardState: {
+        currentPage: 3,
+        userGoal: mockSpec.userGoal,
+      },
+      chatContext: [
+        { role: 'user', text: 'Find offline tools', timestamp: 1731360001000 },
+        { role: 'assistant', text: 'Searching...', timestamp: 1731360002000 },
+      ],
+    };
+
+    db.saveCheckpoint(chk);
+
+    const retrieved = db.getCheckpoint('chk-001');
+    assert.ok(retrieved, 'retrieved checkpoint should not be null');
+    assert.equal(retrieved.id, 'chk-001');
+    assert.equal(retrieved.taskId, mockSpec.id);
+    assert.equal(retrieved.runId, 'run-101');
+    assert.equal(retrieved.createdAt, 1731360000000);
+    assert.equal(retrieved.updatedAt, 1731360010000);
+    assert.equal(retrieved.status, 'paused');
+    assert.equal(retrieved.targetUrl, mockSpec.targetUrl);
+    assert.equal(retrieved.currentUrl, 'https://news.ycombinator.com/item?id=123');
+    assert.equal(retrieved.pageTitle, 'Item Detail');
+    assert.deepEqual(retrieved.scroll, { y: 650, scrollHeight: 2400, viewportHeight: 800 });
+    assert.equal(retrieved.totalScanned, 25);
+    assert.equal(retrieved.totalAlerts, 3);
+    assert.equal(retrieved.activeStepCount, 8);
+    assert.deepEqual(retrieved.dedupHashes, ['hash-a', 'hash-b']);
+    assert.deepEqual(retrieved.modelConfig, {
+      systemOneModel: 'modernbert-onnx-fp32',
+      systemTwoModel: 'qwen2.5:3b',
+    });
+    assert.deepEqual(retrieved.wizardState, {
+      currentPage: 3,
+      userGoal: mockSpec.userGoal,
+    });
+    assert.equal(retrieved.chatContext?.length, 2);
+    assert.equal(retrieved.chatContext?.[0].role, 'user');
+    assert.equal(retrieved.chatContext?.[1].text, 'Searching...');
+
+    // Non-existent id
+    assert.equal(db.getCheckpoint('non-existent-chk'), null);
+
+    // Update on conflict
+    const updatedChk: TaskCheckpoint = {
+      ...chk,
+      status: 'running',
+      updatedAt: 1731360020000,
+      totalScanned: 30,
+      activeStepCount: 10,
+    };
+    db.saveCheckpoint(updatedChk);
+
+    const retrievedAfterUpdate = db.getCheckpoint('chk-001');
+    assert.ok(retrievedAfterUpdate);
+    assert.equal(retrievedAfterUpdate.status, 'running');
+    assert.equal(retrievedAfterUpdate.updatedAt, 1731360020000);
+    assert.equal(retrievedAfterUpdate.totalScanned, 30);
+    assert.equal(retrievedAfterUpdate.activeStepCount, 10);
+  });
+
+  it('retrieves latest checkpoint and lists multiple checkpoints by taskId ordered by updatedAt DESC', () => {
+    db.insertTask(mockSpec);
+
+    const baseCheckpoint = {
+      taskId: mockSpec.id,
+      runId: 'run-101',
+      status: 'paused' as const,
+      targetUrl: mockSpec.targetUrl,
+      currentUrl: mockSpec.targetUrl,
+      scroll: { y: 100, scrollHeight: 1000, viewportHeight: 500 },
+      totalScanned: 10,
+      totalAlerts: 1,
+      activeStepCount: 3,
+      dedupHashes: [],
+    };
+
+    db.saveCheckpoint({ ...baseCheckpoint, id: 'chk-1', createdAt: 1000, updatedAt: 2000 });
+    db.saveCheckpoint({ ...baseCheckpoint, id: 'chk-2', createdAt: 1000, updatedAt: 4000 });
+    db.saveCheckpoint({ ...baseCheckpoint, id: 'chk-3', createdAt: 1000, updatedAt: 3000 });
+
+    const latest = db.getLatestCheckpoint(mockSpec.id);
+    assert.ok(latest);
+    assert.equal(latest.id, 'chk-2', 'latest should have updatedAt = 4000');
+
+    const list = db.listCheckpoints(mockSpec.id);
+    assert.equal(list.length, 3);
+    assert.equal(list[0].id, 'chk-2');
+    assert.equal(list[1].id, 'chk-3');
+    assert.equal(list[2].id, 'chk-1');
+
+    assert.equal(db.getLatestCheckpoint('ghost-task-id'), null);
+    assert.deepEqual(db.listCheckpoints('ghost-task-id'), []);
+  });
+
+  it('deletes checkpoint by id', () => {
+    db.insertTask(mockSpec);
+
+    const chk: TaskCheckpoint = {
+      id: 'chk-del',
+      taskId: mockSpec.id,
+      runId: 'run-del',
+      createdAt: 1000,
+      updatedAt: 1000,
+      status: 'stopped',
+      targetUrl: mockSpec.targetUrl,
+      currentUrl: mockSpec.targetUrl,
+      scroll: { y: 0, scrollHeight: 1000, viewportHeight: 800 },
+      totalScanned: 0,
+      totalAlerts: 0,
+      activeStepCount: 0,
+      dedupHashes: [],
+    };
+
+    db.saveCheckpoint(chk);
+    assert.ok(db.getCheckpoint('chk-del'));
+
+    const deleted = db.deleteCheckpoint('chk-del');
+    assert.equal(deleted, true);
+    assert.equal(db.getCheckpoint('chk-del'), null);
+
+    // Deleting again returns false
+    assert.equal(db.deleteCheckpoint('chk-del'), false);
+  });
+
+  it('enforces foreign key constraints and cascades deletion from task to checkpoints', () => {
+    const orphanChk: TaskCheckpoint = {
+      id: 'chk-orphan',
+      taskId: 'ghost-task-999',
+      runId: 'run-orphan',
+      createdAt: 1000,
+      updatedAt: 1000,
+      status: 'paused',
+      targetUrl: 'https://example.com',
+      currentUrl: 'https://example.com',
+      scroll: { y: 0, scrollHeight: 1000, viewportHeight: 800 },
+      totalScanned: 0,
+      totalAlerts: 0,
+      activeStepCount: 0,
+      dedupHashes: [],
+    };
+
+    assert.throws(
+      () => {
+        db.saveCheckpoint(orphanChk);
+      },
+      /FOREIGN KEY constraint failed/i
+    );
+
+    // Now test cascade deletion
+    db.insertTask(mockSpec);
+    db.saveCheckpoint({ ...orphanChk, id: 'chk-cascade-1', taskId: mockSpec.id });
+    db.saveCheckpoint({ ...orphanChk, id: 'chk-cascade-2', taskId: mockSpec.id });
+
+    assert.equal(db.listCheckpoints(mockSpec.id).length, 2);
+
+    // Delete parent task
+    db.deleteTask(mockSpec.id);
+
+    // Checkpoints should be deleted by foreign key cascade
+    assert.equal(db.listCheckpoints(mockSpec.id).length, 0);
+    assert.equal(db.getCheckpoint('chk-cascade-1'), null);
+    assert.equal(db.getCheckpoint('chk-cascade-2'), null);
+  });
+
+  it('persists and lists agent actions by runId ordered by timestamp ASC', () => {
+    const act1: AgentAction = {
+      id: 'act-1',
+      taskId: mockSpec.id,
+      timestamp: 3000,
+      type: 'scroll',
+      status: 'success',
+      message: 'Scrolled 400px down',
+    };
+    const act2: AgentAction = {
+      id: 'act-2',
+      taskId: mockSpec.id,
+      timestamp: 1000,
+      type: 'navigation',
+      status: 'success',
+      message: 'Navigated to target URL',
+    };
+    const act3: AgentAction = {
+      id: 'act-3',
+      taskId: mockSpec.id,
+      timestamp: 2000,
+      type: 'interaction',
+      status: 'success',
+      message: 'Filled search input with "local LLM"',
+      details: { selector: 'input#search-box', value: 'local LLM' },
+    };
+    const actOtherRun: AgentAction = {
+      id: 'act-other',
+      taskId: mockSpec.id,
+      timestamp: 1500,
+      type: 'alert',
+      status: 'warning',
+      message: 'Alert triggered',
+    };
+
+    db.saveAgentAction(act1, 'run-alpha');
+    db.saveAgentAction(act2, 'run-alpha');
+    db.saveAgentAction(act3, 'run-alpha');
+    db.saveAgentAction(actOtherRun, 'run-beta');
+
+    const alphaActions = db.listAgentActions('run-alpha');
+    assert.equal(alphaActions.length, 3);
+    // Ordered by timestamp ASC: act-2 (1000), act-3 (2000), act-1 (3000)
+    assert.equal(alphaActions[0].id, 'act-2');
+    assert.equal(alphaActions[1].id, 'act-3');
+    assert.equal(alphaActions[2].id, 'act-1');
+
+    assert.equal(alphaActions[1].type, 'interaction');
+    assert.equal(alphaActions[1].message, 'Filled search input with "local LLM"');
+    assert.deepEqual(alphaActions[1].details, { selector: 'input#search-box', value: 'local LLM' });
+    assert.equal(alphaActions[1].taskId, mockSpec.id);
+
+    const betaActions = db.listAgentActions('run-beta');
+    assert.equal(betaActions.length, 1);
+    assert.equal(betaActions[0].id, 'act-other');
+
+    assert.deepEqual(db.listAgentActions('non-existent-run'), []);
+  });
+
+  it('auto-generates unique action id when id is omitted', () => {
+    const actionWithoutId: any = {
+      taskId: mockSpec.id,
+      timestamp: Date.now(),
+      type: 'system',
+      status: 'success',
+      message: 'Daemon initialized',
+    };
+
+    db.saveAgentAction(actionWithoutId, 'run-auto-id');
+    const actions = db.listAgentActions('run-auto-id');
+    assert.equal(actions.length, 1);
+    assert.ok(actions[0].id.startsWith('act_'), 'id should start with act_');
+  });
+
+  it('persists checkpoints and agent actions across disk reconnects', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-chk-test-'));
+    const tempDbPath = path.join(tempDir, 'test_checkpoints.db');
+
+    try {
+      const diskDb = new ScoutDatabase(tempDbPath);
+      diskDb.insertTask(mockSpec);
+
+      const chk: TaskCheckpoint = {
+        id: 'chk-disk-01',
+        taskId: mockSpec.id,
+        runId: 'run-disk',
+        createdAt: 1731360000000,
+        updatedAt: 1731360010000,
+        status: 'interrupted',
+        targetUrl: mockSpec.targetUrl,
+        currentUrl: mockSpec.targetUrl,
+        scroll: { y: 800, scrollHeight: 3000, viewportHeight: 900 },
+        totalScanned: 50,
+        totalAlerts: 5,
+        activeStepCount: 12,
+        dedupHashes: ['h1', 'h2'],
+        modelConfig: { systemOneModel: 'm1' },
+      };
+      diskDb.saveCheckpoint(chk);
+
+      const action: AgentAction = {
+        id: 'act-disk-01',
+        taskId: mockSpec.id,
+        timestamp: 1731360005000,
+        type: 'interaction',
+        status: 'success',
+        message: 'Action on disk',
+        details: { step: 12 },
+      };
+      diskDb.saveAgentAction(action, 'run-disk');
+      diskDb.close();
+
+      // Reopen from disk
+      const reopenedDb = new ScoutDatabase(tempDbPath);
+      const loadedChk = reopenedDb.getCheckpoint('chk-disk-01');
+      assert.ok(loadedChk);
+      assert.equal(loadedChk.status, 'interrupted');
+      assert.equal(loadedChk.totalScanned, 50);
+      assert.deepEqual(loadedChk.dedupHashes, ['h1', 'h2']);
+      assert.deepEqual(loadedChk.modelConfig, { systemOneModel: 'm1' });
+
+      const loadedActions = reopenedDb.listAgentActions('run-disk');
+      assert.equal(loadedActions.length, 1);
+      assert.equal(loadedActions[0].id, 'act-disk-01');
+      assert.equal(loadedActions[0].type, 'interaction');
+      assert.deepEqual(loadedActions[0].details, { step: 12 });
+
+      reopenedDb.close();
+    } finally {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch {
+        // ignore
       }
     }
   });

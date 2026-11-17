@@ -17,8 +17,19 @@ import type {
   SystemPerformanceMetrics,
   ServiceHealthItem,
   WsClientToServerMessage,
-  WsServerToClientMessage
+  WsServerToClientMessage,
+  InteractiveInputElement,
+  NavigationChoice,
+  TaskCheckpoint,
+  GgufModelInfo
 } from '../../packages/shared/src/types';
+
+export type {
+  InteractiveInputElement,
+  NavigationChoice,
+  TaskCheckpoint,
+  GgufModelInfo
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1090,246 +1101,625 @@ export function createTestSqliteDb(dbPath = ':memory:') {
 
         CREATE INDEX IF NOT EXISTS idx_job_runs_job_id ON job_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_job_runs_started_at ON job_runs(started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS task_checkpoints (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          target_url TEXT NOT NULL,
+          current_url TEXT NOT NULL,
+          page_title TEXT,
+          scroll_y REAL NOT NULL,
+          scroll_height REAL NOT NULL,
+          viewport_height REAL NOT NULL,
+          total_scanned INTEGER NOT NULL,
+          total_alerts INTEGER NOT NULL,
+          active_step_count INTEGER NOT NULL,
+          dedup_hashes_json TEXT NOT NULL,
+          model_config_json TEXT,
+          wizard_state_json TEXT,
+          chat_context_json TEXT,
+          FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_task_id ON task_checkpoints(task_id);
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_updated_at ON task_checkpoints(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS agent_actions (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          timestamp INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          message TEXT NOT NULL,
+          details_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_actions_run_id ON agent_actions(run_id);
       `);
-      return { db, isNative: true };
+
+      const insertCheckpointStmt = db.prepare(`
+        INSERT INTO task_checkpoints (
+          id, task_id, run_id, created_at, updated_at, status, target_url, current_url, page_title,
+          scroll_y, scroll_height, viewport_height, total_scanned, total_alerts, active_step_count,
+          dedup_hashes_json, model_config_json, wizard_state_json, chat_context_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          task_id = excluded.task_id,
+          run_id = excluded.run_id,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at,
+          status = excluded.status,
+          target_url = excluded.target_url,
+          current_url = excluded.current_url,
+          page_title = excluded.page_title,
+          scroll_y = excluded.scroll_y,
+          scroll_height = excluded.scroll_height,
+          viewport_height = excluded.viewport_height,
+          total_scanned = excluded.total_scanned,
+          total_alerts = excluded.total_alerts,
+          active_step_count = excluded.active_step_count,
+          dedup_hashes_json = excluded.dedup_hashes_json,
+          model_config_json = excluded.model_config_json,
+          wizard_state_json = excluded.wizard_state_json,
+          chat_context_json = excluded.chat_context_json
+      `);
+
+      const getLatestCheckpointStmt = db.prepare(`
+        SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1
+      `);
+      const listCheckpointsStmt = db.prepare(`
+        SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY updated_at DESC
+      `);
+      const deleteCheckpointStmt = db.prepare(`DELETE FROM task_checkpoints WHERE id = ?`);
+
+      const insertAgentActionStmt = db.prepare(`
+        INSERT INTO agent_actions (id, run_id, timestamp, type, status, message, details_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          run_id = excluded.run_id,
+          timestamp = excluded.timestamp,
+          type = excluded.type,
+          status = excluded.status,
+          message = excluded.message,
+          details_json = excluded.details_json
+      `);
+      const listAgentActionsStmt = db.prepare(`
+        SELECT * FROM agent_actions WHERE run_id = ? ORDER BY timestamp ASC
+      `);
+
+      const rowToCheckpoint = (row: any): TaskCheckpoint => {
+        let dedupHashes: string[] = [];
+        try { dedupHashes = row.dedup_hashes_json ? JSON.parse(row.dedup_hashes_json) : []; } catch {}
+        let modelConfig: any = undefined;
+        try { modelConfig = row.model_config_json ? JSON.parse(row.model_config_json) : undefined; } catch {}
+        let wizardState: any = undefined;
+        try { wizardState = row.wizard_state_json ? JSON.parse(row.wizard_state_json) : undefined; } catch {}
+        let chatContext: any = undefined;
+        try { chatContext = row.chat_context_json ? JSON.parse(row.chat_context_json) : undefined; } catch {}
+        return {
+          id: row.id,
+          taskId: row.task_id,
+          runId: row.run_id,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+          status: row.status,
+          targetUrl: row.target_url,
+          currentUrl: row.current_url,
+          pageTitle: row.page_title ?? undefined,
+          scroll: {
+            y: row.scroll_y,
+            scrollHeight: row.scroll_height,
+            viewportHeight: row.viewport_height,
+          },
+          totalScanned: row.total_scanned,
+          totalAlerts: row.total_alerts,
+          activeStepCount: row.active_step_count,
+          dedupHashes,
+          modelConfig,
+          wizardState,
+          chatContext,
+        };
+      };
+
+      const saveCheckpoint = (checkpoint: TaskCheckpoint): void => {
+        if (!checkpoint) return;
+        insertCheckpointStmt.run(
+          checkpoint.id,
+          checkpoint.taskId,
+          checkpoint.runId,
+          checkpoint.createdAt,
+          checkpoint.updatedAt,
+          checkpoint.status,
+          checkpoint.targetUrl,
+          checkpoint.currentUrl,
+          checkpoint.pageTitle ?? null,
+          checkpoint.scroll?.y ?? 0,
+          checkpoint.scroll?.scrollHeight ?? 0,
+          checkpoint.scroll?.viewportHeight ?? 0,
+          checkpoint.totalScanned ?? 0,
+          checkpoint.totalAlerts ?? 0,
+          checkpoint.activeStepCount ?? 0,
+          JSON.stringify(checkpoint.dedupHashes ?? []),
+          checkpoint.modelConfig ? JSON.stringify(checkpoint.modelConfig) : null,
+          checkpoint.wizardState ? JSON.stringify(checkpoint.wizardState) : null,
+          checkpoint.chatContext ? JSON.stringify(checkpoint.chatContext) : null
+        );
+      };
+
+      const getLatestCheckpoint = (taskId: string): TaskCheckpoint | null => {
+        const row = getLatestCheckpointStmt.get(taskId);
+        return row ? rowToCheckpoint(row) : null;
+      };
+
+      const listCheckpoints = (taskId: string): TaskCheckpoint[] => {
+        const rows = listCheckpointsStmt.all(taskId) as any[];
+        return rows.map(rowToCheckpoint);
+      };
+
+      const deleteCheckpoint = (checkpointId: string): boolean => {
+        const info = deleteCheckpointStmt.run(checkpointId);
+        return info.changes > 0;
+      };
+
+      const saveAgentAction = (action: AgentAction, runId: string): void => {
+        if (!action) return;
+        insertAgentActionStmt.run(
+          action.id,
+          runId,
+          action.timestamp,
+          action.type,
+          action.status,
+          action.message,
+          action.details ? JSON.stringify(action.details) : null
+        );
+      };
+
+      const listAgentActions = (runId: string): AgentAction[] => {
+        const rows = listAgentActionsStmt.all(runId) as any[];
+        return rows.map((r) => {
+          let details: any = undefined;
+          if (r.details_json) {
+            try { details = JSON.parse(r.details_json); } catch {}
+          }
+          return {
+            id: r.id,
+            taskId: details?.taskId || '',
+            timestamp: r.timestamp,
+            type: r.type,
+            status: r.status,
+            message: r.message,
+            details,
+          };
+        });
+      };
+
+      db.saveCheckpoint = saveCheckpoint;
+      db.getLatestCheckpoint = getLatestCheckpoint;
+      db.listCheckpoints = listCheckpoints;
+      db.deleteCheckpoint = deleteCheckpoint;
+      db.saveAgentAction = saveAgentAction;
+      db.listAgentActions = listAgentActions;
+
+      return {
+        db,
+        isNative: true,
+        saveCheckpoint,
+        getLatestCheckpoint,
+        listCheckpoints,
+        deleteCheckpoint,
+        saveAgentAction,
+        listAgentActions,
+      };
     } catch {
       // Fall through to in-memory shim
     }
   }
 
-  // In-memory shim fallback providing complete support for tasks, alerts, jobs, and job_runs
+  // In-memory shim fallback providing complete support for tasks, alerts, jobs, job_runs, checkpoints, and actions
   const tasks = new Map<string, any>();
   const alerts: any[] = [];
   const jobs = new Map<string, any>();
   const jobRuns = new Map<string, any>();
+  const checkpoints = new Map<string, any>();
+  const agentActions: any[] = [];
+
+  const rowToCheckpointShim = (c: any): TaskCheckpoint => ({
+    id: c.id,
+    taskId: c.taskId,
+    runId: c.runId,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    status: c.status,
+    targetUrl: c.targetUrl,
+    currentUrl: c.currentUrl,
+    pageTitle: c.pageTitle,
+    scroll: {
+      y: c.scrollY ?? 0,
+      scrollHeight: c.scrollHeight ?? 0,
+      viewportHeight: c.viewportHeight ?? 0,
+    },
+    totalScanned: c.totalScanned ?? 0,
+    totalAlerts: c.totalAlerts ?? 0,
+    activeStepCount: c.activeStepCount ?? 0,
+    dedupHashes: c.dedupHashes ?? [],
+    modelConfig: c.modelConfig,
+    wizardState: c.wizardState,
+    chatContext: c.chatContext,
+  });
+
+  const saveCheckpointShim = (checkpoint: TaskCheckpoint): void => {
+    if (!checkpoint) return;
+    checkpoints.set(checkpoint.id, {
+      id: checkpoint.id,
+      taskId: checkpoint.taskId,
+      runId: checkpoint.runId,
+      createdAt: checkpoint.createdAt,
+      updatedAt: checkpoint.updatedAt,
+      status: checkpoint.status,
+      targetUrl: checkpoint.targetUrl,
+      currentUrl: checkpoint.currentUrl,
+      pageTitle: checkpoint.pageTitle,
+      scrollY: checkpoint.scroll?.y ?? 0,
+      scrollHeight: checkpoint.scroll?.scrollHeight ?? 0,
+      viewportHeight: checkpoint.scroll?.viewportHeight ?? 0,
+      totalScanned: checkpoint.totalScanned ?? 0,
+      totalAlerts: checkpoint.totalAlerts ?? 0,
+      activeStepCount: checkpoint.activeStepCount ?? 0,
+      dedupHashes: checkpoint.dedupHashes ?? [],
+      modelConfig: checkpoint.modelConfig,
+      wizardState: checkpoint.wizardState,
+      chatContext: checkpoint.chatContext,
+    });
+  };
+
+  const getLatestCheckpointShim = (taskId: string): TaskCheckpoint | null => {
+    const matching = Array.from(checkpoints.values()).filter((c) => c.taskId === taskId);
+    if (matching.length === 0) return null;
+    matching.sort((a, b) => b.updatedAt - a.updatedAt);
+    return rowToCheckpointShim(matching[0]);
+  };
+
+  const listCheckpointsShim = (taskId: string): TaskCheckpoint[] => {
+    const matching = Array.from(checkpoints.values()).filter((c) => c.taskId === taskId);
+    matching.sort((a, b) => b.updatedAt - a.updatedAt);
+    return matching.map(rowToCheckpointShim);
+  };
+
+  const deleteCheckpointShim = (checkpointId: string): boolean => {
+    return checkpoints.delete(checkpointId);
+  };
+
+  const saveAgentActionShim = (action: AgentAction, runId: string): void => {
+    if (!action) return;
+    agentActions.push({
+      id: action.id,
+      runId,
+      timestamp: action.timestamp,
+      type: action.type,
+      status: action.status,
+      message: action.message,
+      details: action.details,
+    });
+  };
+
+  const listAgentActionsShim = (runId: string): AgentAction[] => {
+    return agentActions
+      .filter((a) => a.runId === runId)
+      .map((a) => ({
+        id: a.id,
+        taskId: a.details?.taskId || '',
+        timestamp: a.timestamp,
+        type: a.type,
+        status: a.status,
+        message: a.message,
+        details: a.details,
+      }));
+  };
+
+  const shimDb: any = {
+    pragma: (p: string) => (p.includes('journal_mode') ? 'wal' : 'normal'),
+    exec: (_sql: string) => {},
+    prepare: (query: string) => {
+      const lower = query.toLowerCase();
+      return {
+        run: (...args: any[]) => {
+          if (lower.includes('insert into task_checkpoints')) {
+            const [id, taskId, runId, createdAt, updatedAt, status, targetUrl, currentUrl, pageTitle, scrollY, scrollHeight, viewportHeight, totalScanned, totalAlerts, activeStepCount, dedupJson, modelJson, wizardJson, chatJson] = args;
+            checkpoints.set(id, {
+              id,
+              taskId,
+              runId,
+              createdAt,
+              updatedAt,
+              status,
+              targetUrl,
+              currentUrl,
+              pageTitle,
+              scrollY,
+              scrollHeight,
+              viewportHeight,
+              totalScanned,
+              totalAlerts,
+              activeStepCount,
+              dedupHashes: dedupJson ? JSON.parse(dedupJson) : [],
+              modelConfig: modelJson ? JSON.parse(modelJson) : undefined,
+              wizardState: wizardJson ? JSON.parse(wizardJson) : undefined,
+              chatContext: chatJson ? JSON.parse(chatJson) : undefined,
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('insert into agent_actions')) {
+            const [id, runId, timestamp, type, status, message, detailsJson] = args;
+            agentActions.push({
+              id,
+              runId,
+              timestamp,
+              type,
+              status,
+              message,
+              details: detailsJson ? JSON.parse(detailsJson) : undefined,
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('insert into tasks')) {
+            let id = args[0];
+            let name = args[1];
+            let user_goal = args[2];
+            let target_url = args[3];
+            let dom_selector = args[4];
+            let poll_interval_ms = 500;
+            let scroll_step_px = 300;
+            let spec_json = '{}';
+            let status = 'ready';
+            let created_at = Date.now();
+
+            if (lower.includes('poll_interval_ms') || args.length >= 9) {
+              poll_interval_ms = args[5] ?? 500;
+              scroll_step_px = args[6] ?? 300;
+              spec_json = args[7] ?? '{}';
+              status = args[8] ?? 'ready';
+              created_at = args[9] ?? Date.now();
+            } else {
+              spec_json = args[5] ?? '{}';
+              status = args[6] ?? 'ready';
+              created_at = args[7] ?? Date.now();
+            }
+
+            tasks.set(id, {
+              id,
+              name,
+              user_goal,
+              target_url,
+              dom_selector,
+              poll_interval_ms,
+              scroll_step_px,
+              spec_json,
+              status,
+              created_at,
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('insert into alerts')) {
+            let id = args[0];
+            let task_id = args[1];
+            let run_id = null;
+            let timestamp = Date.now();
+            let dom_snippet = '';
+            let latency_ms = 0;
+            let raw_answers = '{}';
+            let triggered_alert = 1;
+
+            if (lower.includes('run_id') || args.length >= 8) {
+              run_id = args[2] ?? null;
+              timestamp = args[3];
+              dom_snippet = args[4];
+              latency_ms = args[5];
+              raw_answers = args[6];
+              triggered_alert = args[7] ?? 1;
+            } else {
+              timestamp = args[2];
+              dom_snippet = args[3];
+              latency_ms = args[4];
+              raw_answers = args[5];
+              triggered_alert = args[6] ?? 1;
+            }
+
+            alerts.push({
+              id,
+              task_id,
+              run_id,
+              timestamp,
+              dom_snippet,
+              latency_ms,
+              raw_answers,
+              triggered_alert,
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('insert into jobs')) {
+            const [id, name, spec_json, cron_schedule, is_scheduled, status, last_run_at, next_run_at, created_at, updated_at] = args;
+            jobs.set(id, {
+              id,
+              name,
+              spec_json,
+              cron_schedule: cron_schedule ?? null,
+              is_scheduled: is_scheduled ?? 0,
+              status: status ?? 'idle',
+              last_run_at: last_run_at ?? null,
+              next_run_at: next_run_at ?? null,
+              created_at: created_at ?? Date.now(),
+              updated_at: updated_at ?? Date.now(),
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('insert into job_runs')) {
+            const [id, job_id, started_at, completed_at, status, total_scanned, total_alerts, avg_latency_ms, error] = args;
+            jobRuns.set(id, {
+              id,
+              job_id,
+              started_at,
+              completed_at: completed_at ?? null,
+              status: status ?? 'running',
+              total_scanned: total_scanned ?? 0,
+              total_alerts: total_alerts ?? 0,
+              avg_latency_ms: avg_latency_ms ?? 0,
+              error: error ?? null,
+            });
+            return { changes: 1 };
+          }
+          if (lower.includes('update tasks set status =')) {
+            const id = args[args.length - 1];
+            const task = tasks.get(id);
+            if (task) {
+              const match = lower.match(/status\s*=\s*'([^']+)'/);
+              if (match) {
+                task.status = match[1];
+              } else if (args.length > 1) {
+                task.status = args[0];
+              }
+              return { changes: 1 };
+            }
+          }
+          if (lower.includes('update jobs set')) {
+            const id = args[args.length - 1];
+            const job = jobs.get(id);
+            if (job) {
+              job.updated_at = Date.now();
+              return { changes: 1 };
+            }
+          }
+          if (lower.includes('update job_runs set')) {
+            const id = args[args.length - 1];
+            const run = jobRuns.get(id);
+            if (run) {
+              return { changes: 1 };
+            }
+          }
+          if (lower.includes('delete from alerts')) {
+            const count = alerts.length;
+            alerts.length = 0;
+            return { changes: count };
+          }
+          if (lower.includes('delete from tasks')) {
+            const id = args[0];
+            const existed = tasks.delete(id);
+            return { changes: existed ? 1 : 0 };
+          }
+          if (lower.includes('delete from jobs')) {
+            const id = args[0];
+            const existed = jobs.delete(id);
+            return { changes: existed ? 1 : 0 };
+          }
+          if (lower.includes('delete from job_runs')) {
+            const id = args[0];
+            const existed = jobRuns.delete(id);
+            return { changes: existed ? 1 : 0 };
+          }
+          if (lower.includes('delete from task_checkpoints')) {
+            const id = args[0];
+            const existed = checkpoints.delete(id);
+            return { changes: existed ? 1 : 0 };
+          }
+          return { changes: 0 };
+        },
+        get: (...args: any[]) => {
+          if (lower.includes('count(*)')) {
+            if (lower.includes('from tasks')) return { count: tasks.size };
+            if (lower.includes('from alerts')) {
+              if (lower.includes('where task_id =')) {
+                return { count: alerts.filter((a) => a.task_id === args[0]).length };
+              }
+              if (lower.includes('where run_id =')) {
+                return { count: alerts.filter((a) => a.run_id === args[0]).length };
+              }
+              return { count: alerts.length };
+            }
+            if (lower.includes('from jobs')) return { count: jobs.size };
+            if (lower.includes('from job_runs')) {
+              if (lower.includes('where job_id =')) {
+                return { count: Array.from(jobRuns.values()).filter((r) => r.job_id === args[0]).length };
+              }
+              return { count: jobRuns.size };
+            }
+            if (lower.includes('from task_checkpoints')) return { count: checkpoints.size };
+            if (lower.includes('from agent_actions')) return { count: agentActions.length };
+          }
+          if (lower.includes('from task_checkpoints where task_id =') && lower.includes('order by updated_at desc')) {
+            return getLatestCheckpointShim(args[0]);
+          }
+          if (lower.includes('from task_checkpoints where id =')) {
+            const c = checkpoints.get(args[0]);
+            return c ? rowToCheckpointShim(c) : null;
+          }
+          if (lower.includes('from tasks where id =')) {
+            return tasks.get(args[0]) || null;
+          }
+          if (lower.includes('from alerts where id =')) {
+            return alerts.find((a) => a.id === args[0]) || null;
+          }
+          if (lower.includes('from jobs where id =')) {
+            return jobs.get(args[0]) || null;
+          }
+          if (lower.includes('from job_runs where id =')) {
+            return jobRuns.get(args[0]) || null;
+          }
+          return null;
+        },
+        all: (...args: any[]) => {
+          if (lower.includes('from task_checkpoints where task_id =')) {
+            return listCheckpointsShim(args[0]);
+          }
+          if (lower.includes('from agent_actions where run_id =')) {
+            return listAgentActionsShim(args[0]);
+          }
+          if (lower.includes('from tasks')) {
+            return Array.from(tasks.values());
+          }
+          if (lower.includes('from alerts')) {
+            if (lower.includes('where task_id =')) {
+              return alerts.filter((a) => a.task_id === args[0]);
+            }
+            if (lower.includes('where run_id =')) {
+              return alerts.filter((a) => a.run_id === args[0]);
+            }
+            return [...alerts];
+          }
+          if (lower.includes('from jobs')) {
+            return Array.from(jobs.values());
+          }
+          if (lower.includes('from job_runs')) {
+            if (lower.includes('where job_id =')) {
+              return Array.from(jobRuns.values()).filter((r) => r.job_id === args[0]);
+            }
+            return Array.from(jobRuns.values());
+          }
+          return [];
+        },
+      };
+    },
+    close: () => {},
+  };
+
+  shimDb.saveCheckpoint = saveCheckpointShim;
+  shimDb.getLatestCheckpoint = getLatestCheckpointShim;
+  shimDb.listCheckpoints = listCheckpointsShim;
+  shimDb.deleteCheckpoint = deleteCheckpointShim;
+  shimDb.saveAgentAction = saveAgentActionShim;
+  shimDb.listAgentActions = listAgentActionsShim;
 
   return {
     isNative: false,
-    db: {
-      pragma: (p: string) => (p.includes('journal_mode') ? 'wal' : 'normal'),
-      exec: (_sql: string) => {},
-      prepare: (query: string) => {
-        const lower = query.toLowerCase();
-        return {
-          run: (...args: any[]) => {
-            if (lower.includes('insert into tasks')) {
-              let id = args[0];
-              let name = args[1];
-              let user_goal = args[2];
-              let target_url = args[3];
-              let dom_selector = args[4];
-              let poll_interval_ms = 500;
-              let scroll_step_px = 300;
-              let spec_json = '{}';
-              let status = 'ready';
-              let created_at = Date.now();
-
-              if (lower.includes('poll_interval_ms') || args.length >= 9) {
-                poll_interval_ms = args[5] ?? 500;
-                scroll_step_px = args[6] ?? 300;
-                spec_json = args[7] ?? '{}';
-                status = args[8] ?? 'ready';
-                created_at = args[9] ?? Date.now();
-              } else {
-                spec_json = args[5] ?? '{}';
-                status = args[6] ?? 'ready';
-                created_at = args[7] ?? Date.now();
-              }
-
-              tasks.set(id, {
-                id,
-                name,
-                user_goal,
-                target_url,
-                dom_selector,
-                poll_interval_ms,
-                scroll_step_px,
-                spec_json,
-                status,
-                created_at,
-              });
-              return { changes: 1 };
-            }
-            if (lower.includes('insert into alerts')) {
-              let id = args[0];
-              let task_id = args[1];
-              let run_id = null;
-              let timestamp = Date.now();
-              let dom_snippet = '';
-              let latency_ms = 0;
-              let raw_answers = '{}';
-              let triggered_alert = 1;
-
-              if (lower.includes('run_id') || args.length >= 8) {
-                run_id = args[2] ?? null;
-                timestamp = args[3];
-                dom_snippet = args[4];
-                latency_ms = args[5];
-                raw_answers = args[6];
-                triggered_alert = args[7] ?? 1;
-              } else {
-                timestamp = args[2];
-                dom_snippet = args[3];
-                latency_ms = args[4];
-                raw_answers = args[5];
-                triggered_alert = args[6] ?? 1;
-              }
-
-              alerts.push({
-                id,
-                task_id,
-                run_id,
-                timestamp,
-                dom_snippet,
-                latency_ms,
-                raw_answers,
-                triggered_alert,
-              });
-              return { changes: 1 };
-            }
-            if (lower.includes('insert into jobs')) {
-              const [id, name, spec_json, cron_schedule, is_scheduled, status, last_run_at, next_run_at, created_at, updated_at] = args;
-              jobs.set(id, {
-                id,
-                name,
-                spec_json,
-                cron_schedule: cron_schedule ?? null,
-                is_scheduled: is_scheduled ?? 0,
-                status: status ?? 'idle',
-                last_run_at: last_run_at ?? null,
-                next_run_at: next_run_at ?? null,
-                created_at: created_at ?? Date.now(),
-                updated_at: updated_at ?? Date.now(),
-              });
-              return { changes: 1 };
-            }
-            if (lower.includes('insert into job_runs')) {
-              const [id, job_id, started_at, completed_at, status, total_scanned, total_alerts, avg_latency_ms, error] = args;
-              jobRuns.set(id, {
-                id,
-                job_id,
-                started_at,
-                completed_at: completed_at ?? null,
-                status: status ?? 'running',
-                total_scanned: total_scanned ?? 0,
-                total_alerts: total_alerts ?? 0,
-                avg_latency_ms: avg_latency_ms ?? 0,
-                error: error ?? null,
-              });
-              return { changes: 1 };
-            }
-            if (lower.includes('update tasks set status =')) {
-              const id = args[args.length - 1];
-              const task = tasks.get(id);
-              if (task) {
-                const match = lower.match(/status\s*=\s*'([^']+)'/);
-                if (match) {
-                  task.status = match[1];
-                } else if (args.length > 1) {
-                  task.status = args[0];
-                }
-                return { changes: 1 };
-              }
-            }
-            if (lower.includes('update jobs set')) {
-              const id = args[args.length - 1];
-              const job = jobs.get(id);
-              if (job) {
-                job.updated_at = Date.now();
-                return { changes: 1 };
-              }
-            }
-            if (lower.includes('update job_runs set')) {
-              const id = args[args.length - 1];
-              const run = jobRuns.get(id);
-              if (run) {
-                return { changes: 1 };
-              }
-            }
-            if (lower.includes('delete from alerts')) {
-              const count = alerts.length;
-              alerts.length = 0;
-              return { changes: count };
-            }
-            if (lower.includes('delete from tasks')) {
-              const id = args[0];
-              const existed = tasks.delete(id);
-              return { changes: existed ? 1 : 0 };
-            }
-            if (lower.includes('delete from jobs')) {
-              const id = args[0];
-              const existed = jobs.delete(id);
-              return { changes: existed ? 1 : 0 };
-            }
-            if (lower.includes('delete from job_runs')) {
-              const id = args[0];
-              const existed = jobRuns.delete(id);
-              return { changes: existed ? 1 : 0 };
-            }
-            return { changes: 0 };
-          },
-          get: (...args: any[]) => {
-            if (lower.includes('count(*)')) {
-              if (lower.includes('from tasks')) return { count: tasks.size };
-              if (lower.includes('from alerts')) {
-                if (lower.includes('where task_id =')) {
-                  return { count: alerts.filter((a) => a.task_id === args[0]).length };
-                }
-                if (lower.includes('where run_id =')) {
-                  return { count: alerts.filter((a) => a.run_id === args[0]).length };
-                }
-                return { count: alerts.length };
-              }
-              if (lower.includes('from jobs')) return { count: jobs.size };
-              if (lower.includes('from job_runs')) {
-                if (lower.includes('where job_id =')) {
-                  return { count: Array.from(jobRuns.values()).filter((r) => r.job_id === args[0]).length };
-                }
-                return { count: jobRuns.size };
-              }
-            }
-            if (lower.includes('from tasks where id =')) {
-              return tasks.get(args[0]) || null;
-            }
-            if (lower.includes('from alerts where id =')) {
-              return alerts.find((a) => a.id === args[0]) || null;
-            }
-            if (lower.includes('from jobs where id =')) {
-              return jobs.get(args[0]) || null;
-            }
-            if (lower.includes('from job_runs where id =')) {
-              return jobRuns.get(args[0]) || null;
-            }
-            return null;
-          },
-          all: (...args: any[]) => {
-            if (lower.includes('from tasks')) {
-              return Array.from(tasks.values());
-            }
-            if (lower.includes('from alerts')) {
-              if (lower.includes('where task_id =')) {
-                return alerts.filter((a) => a.task_id === args[0]);
-              }
-              if (lower.includes('where run_id =')) {
-                return alerts.filter((a) => a.run_id === args[0]);
-              }
-              return [...alerts];
-            }
-            if (lower.includes('from jobs')) {
-              return Array.from(jobs.values());
-            }
-            if (lower.includes('from job_runs')) {
-              if (lower.includes('where job_id =')) {
-                return Array.from(jobRuns.values()).filter((r) => r.job_id === args[0]);
-              }
-              return Array.from(jobRuns.values());
-            }
-            return [];
-          },
-        };
-      },
-      close: () => {},
-    },
+    db: shimDb,
+    saveCheckpoint: saveCheckpointShim,
+    getLatestCheckpoint: getLatestCheckpointShim,
+    listCheckpoints: listCheckpointsShim,
+    deleteCheckpoint: deleteCheckpointShim,
+    saveAgentAction: saveAgentActionShim,
+    listAgentActions: listAgentActionsShim,
   };
 }
 
@@ -1337,12 +1727,38 @@ export function createTestSqliteDb(dbPath = ':memory:') {
 // E2E Track Enhancements: S1/S2 Handover, Model Stats, Results & Simulated Server
 // ===========================================================================
 
+export type HandoverTriggerReason =
+  | 'stagnation'
+  | 'form_input_required'
+  | 'navigation_fork'
+  | 'stalled_progress';
+
+export type StuckReason = 'bottom_of_page' | 'no_new_items' | 'repeated_actions' | 'selector_empty';
+
 export type SystemTwoSteeringAction =
   | { action: 'paginate'; selector: string; text?: string }
   | { action: 'navigate'; url: string }
   | { action: 'switch_tab'; tabIndex?: number; url?: string }
   | { action: 'adjust_strategy'; newSelector?: string; scrollStepPx?: number }
-  | { action: 'terminate'; reason: 'goal_completed' | 'unachievable' | 'exhausted'; message: string };
+  | { action: 'adjust_selector'; selector: string }
+  | { action: 'retry_with_scroll'; scrollStepPx?: number }
+  | { action: 'complete'; message?: string }
+  | { action: 'terminate'; reason: 'goal_completed' | 'unachievable' | 'exhausted'; message: string }
+  | {
+      action: 'form_input';
+      selector: string;
+      text: string;
+      submitSelector?: string;
+      pressEnter?: boolean;
+      reasoning?: string;
+    }
+  | {
+      action: 'choose_navigation';
+      selector: string;
+      url?: string;
+      text?: string;
+      reasoning?: string;
+    };
 
 export interface HandoverContext {
   taskId: string;
@@ -1351,7 +1767,8 @@ export interface HandoverContext {
   targetUrl: string;
   currentUrl: string;
   pageTitle: string;
-  stuckReason: 'bottom_of_page' | 'no_new_items' | 'repeated_actions' | 'selector_empty';
+  triggerReason?: HandoverTriggerReason;
+  stuckReason?: StuckReason;
   scrollState: {
     y: number;
     scrollHeight: number;
@@ -1360,12 +1777,161 @@ export interface HandoverContext {
   totalScanned: number;
   totalAlerts: number;
   consecutiveEmptyCycles: number;
-  interactiveElements: Array<{
+  interactiveElements?: Array<{
     selector: string;
     text: string;
     href?: string;
     tag: string;
   }>;
+  formInputs?: InteractiveInputElement[];
+  navigationChoices?: NavigationChoice[];
+  recentActions?: string[];
+}
+
+export function createTaskCheckpointFixture(overrides: Partial<TaskCheckpoint> = {}): TaskCheckpoint {
+  const now = Date.now();
+  return {
+    id: `chk-${now}-${Math.random().toString(36).slice(2, 7)}`,
+    taskId: 'task-e2e-1',
+    runId: 'run-e2e-1',
+    createdAt: now - 5000,
+    updatedAt: now,
+    status: 'running',
+    targetUrl: 'http://127.0.0.1:8080/docs',
+    currentUrl: 'http://127.0.0.1:8080/docs/page-1',
+    pageTitle: 'Documentation - Page 1',
+    scroll: {
+      y: 1200,
+      scrollHeight: 4000,
+      viewportHeight: 800,
+    },
+    totalScanned: 15,
+    totalAlerts: 3,
+    activeStepCount: 15,
+    dedupHashes: [
+      sha1Hash('item-hash-1'),
+      sha1Hash('item-hash-2'),
+      sha1Hash('item-hash-3'),
+    ],
+    modelConfig: {
+      systemOneModel: 'laya-modernbert.onnx',
+      systemTwoModel: 'llama3:8b',
+    },
+    wizardState: {
+      currentPage: 3,
+      userGoal: 'Scrape documentation articles and identify release notes',
+    },
+    chatContext: [
+      {
+        role: 'user',
+        text: 'Find tutorials on WebGPU ONNX acceleration',
+        timestamp: now - 4000,
+      },
+      {
+        role: 'assistant',
+        text: 'I will navigate to tutorials and search for WebGPU ONNX.',
+        timestamp: now - 3500,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function createInteractiveInputFixture(
+  overrides: Partial<InteractiveInputElement> = {}
+): InteractiveInputElement {
+  return {
+    selector: '#search-box',
+    tag: 'input',
+    type: 'text',
+    name: 'q',
+    placeholder: 'Search documentation...',
+    ariaLabel: 'Search query',
+    formAction: '/search',
+    value: '',
+    ...overrides,
+  };
+}
+
+export function createNavigationChoiceFixture(
+  overrides: Partial<NavigationChoice> = {}
+): NavigationChoice {
+  return {
+    selector: '#nav-releases',
+    text: 'Release Notes',
+    href: '/releases',
+    category: 'Documentation',
+    ...overrides,
+  };
+}
+
+export function createFormInputSteeringFixture(
+  overrides: Partial<Extract<SystemTwoSteeringAction, { action: 'form_input' }>> = {}
+): SystemTwoSteeringAction {
+  return {
+    action: 'form_input',
+    selector: '#search-box',
+    text: 'WebGPU ONNX acceleration',
+    submitSelector: '#search-btn',
+    pressEnter: true,
+    reasoning: 'Input search keywords to find target tutorial',
+    ...overrides,
+  };
+}
+
+export function createChooseNavigationSteeringFixture(
+  overrides: Partial<Extract<SystemTwoSteeringAction, { action: 'choose_navigation' }>> = {}
+): SystemTwoSteeringAction {
+  return {
+    action: 'choose_navigation',
+    selector: '#nav-releases',
+    url: 'http://127.0.0.1:8080/releases',
+    text: 'Release Notes',
+    reasoning: 'Target goal asks for release notes; selecting releases link branch',
+    ...overrides,
+  };
+}
+
+export function createResumeTaskMsg(
+  checkpointId?: string,
+  taskId = 'task-e2e-1'
+): WsClientToServerMessage {
+  return {
+    type: 'RESUME_TASK',
+    payload: {
+      taskId,
+      checkpointId,
+    },
+  };
+}
+
+export function createGetCheckpointsMsg(
+  taskId = 'task-e2e-1'
+): WsClientToServerMessage {
+  return {
+    type: 'GET_CHECKPOINTS',
+    payload: {
+      taskId,
+    },
+  };
+}
+
+export function createCheckpointSavedMsg(
+  checkpoint?: TaskCheckpoint
+): WsServerToClientMessage {
+  return {
+    type: 'CHECKPOINT_SAVED',
+    payload: checkpoint || createTaskCheckpointFixture(),
+  };
+}
+
+export function createCheckpointsListMsg(
+  checkpoints?: TaskCheckpoint[]
+): WsServerToClientMessage {
+  return {
+    type: 'CHECKPOINTS_LIST',
+    payload: checkpoints || [createTaskCheckpointFixture()],
+  };
 }
 
 export type ModelLoadingStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -1416,6 +1982,7 @@ export function createHandoverContextFixture(overrides: Partial<HandoverContext>
     targetUrl: 'http://127.0.0.1/page/1',
     currentUrl: 'http://127.0.0.1/page/1',
     pageTitle: 'Documentation Index',
+    triggerReason: 'stagnation',
     stuckReason: 'bottom_of_page',
     scrollState: {
       y: 2200,
@@ -1428,6 +1995,9 @@ export function createHandoverContextFixture(overrides: Partial<HandoverContext>
     interactiveElements: [
       { selector: '#next-page', text: 'Next Page', href: '/page/2', tag: 'a' },
     ],
+    formInputs: [],
+    navigationChoices: [],
+    recentActions: ['scroll', 'extraction'],
     ...overrides,
   };
 }
@@ -1445,8 +2015,35 @@ export function createSteeringActionFixture(
       return { action: 'switch_tab', tabIndex: 1, ...overrides };
     case 'adjust_strategy':
       return { action: 'adjust_strategy', newSelector: '.article-card', scrollStepPx: 600, ...overrides };
+    case 'adjust_selector':
+      return { action: 'adjust_selector', selector: '.article-card', ...overrides };
+    case 'retry_with_scroll':
+      return { action: 'retry_with_scroll', scrollStepPx: 500, ...overrides };
+    case 'complete':
+      return { action: 'complete', message: 'Task goal completed', ...overrides };
     case 'terminate':
       return { action: 'terminate', reason: 'goal_completed', message: 'Task goal completed', ...overrides };
+    case 'form_input':
+      return {
+        action: 'form_input',
+        selector: '#search-box',
+        text: 'WebGPU ONNX acceleration',
+        submitSelector: '#search-btn',
+        pressEnter: true,
+        reasoning: 'Input search query to fulfill user goal',
+        ...overrides,
+      };
+    case 'choose_navigation':
+      return {
+        action: 'choose_navigation',
+        selector: '#nav-releases',
+        url: 'http://127.0.0.1/releases',
+        text: 'Release Notes',
+        reasoning: 'Navigate to target release notes section',
+        ...overrides,
+      };
+    default:
+      return { action: 'paginate', selector: '#next-page', text: 'Next Page', ...overrides };
   }
 }
 
@@ -1509,6 +2106,27 @@ export interface SimulatedItem {
   metadata?: Record<string, any>;
 }
 
+export interface SimulatedFormField {
+  tag?: 'input' | 'textarea' | 'select' | 'button';
+  type?: string;
+  name?: string;
+  id?: string;
+  selector?: string;
+  placeholder?: string;
+  value?: string;
+  options?: Array<{ value: string; label: string }>;
+  disabled?: boolean;
+}
+
+export interface SimulatedFormConfig {
+  id?: string;
+  action?: string;
+  method?: string;
+  selector?: string;
+  fields: SimulatedFormField[];
+  submitButton?: { selector?: string; text?: string; id?: string };
+}
+
 export interface SimulatedPageConfig {
   title?: string;
   items?: SimulatedItem[];
@@ -1522,7 +2140,10 @@ export interface SimulatedPageConfig {
   isBottom?: boolean; // if true, indicates end of content / no more pages
   status?: number; // HTTP status code, defaults to 200
   delayMs?: number; // optional delay to test timeout/loading
-  interactiveElements?: Array<{ selector: string; text: string; href?: string; tag: string }>;
+  interactiveElements?: Array<{ selector: string; text?: string; href?: string; tag: string }>;
+  forms?: SimulatedFormConfig[];
+  formInputs?: InteractiveInputElement[];
+  navigationChoices?: NavigationChoice[];
 }
 
 export interface SimulatedInfiniteScrollConfig {
@@ -1666,6 +2287,12 @@ export function createSimulatedWebServer(options: SimulatedWebServerOptions = {}
     }
 
     if (!pageConfig) {
+      if (req.method === 'POST') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.end(`<!DOCTYPE html><html><body><div id="form-submitted">Submitted successfully</div><div class="item">Filtered Result 1</div></body></html>`);
+        return;
+      }
       res.statusCode = 404;
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.end(`Not Found: ${pathname}`);
@@ -1713,11 +2340,63 @@ export function createSimulatedWebServer(options: SimulatedWebServerOptions = {}
 
     let interactiveHtml = '';
     if (pageConfig.interactiveElements && pageConfig.interactiveElements.length > 0) {
-      interactiveHtml = pageConfig.interactiveElements.map((el) => {
+      interactiveHtml += pageConfig.interactiveElements.map((el) => {
         if (el.tag === 'a') {
-          return `<a href="${el.href || '#'}" class="${el.selector.replace(/^[.#]/, '')}">${el.text}</a>`;
+          return `<a href="${el.href || '#'}" class="${el.selector.replace(/^[.#]/, '')}">${el.text || ''}</a>`;
         }
-        return `<button class="${el.selector.replace(/^[.#]/, '')}">${el.text}</button>`;
+        return `<button class="${el.selector.replace(/^[.#]/, '')}">${el.text || ''}</button>`;
+      }).join('\n');
+    }
+
+    if (pageConfig.navigationChoices && pageConfig.navigationChoices.length > 0) {
+      interactiveHtml += '\n<div class="navigation-forks">\n' + pageConfig.navigationChoices.map((choice) => {
+        const idAttr = choice.selector.startsWith('#') ? `id="${choice.selector.slice(1)}"` : '';
+        const classAttr = choice.selector.startsWith('.') ? `class="${choice.selector.slice(1)}"` : 'class="nav-fork"';
+        const catAttr = choice.category ? `data-category="${choice.category}"` : '';
+        return `<a href="${choice.href || '#'}" ${idAttr} ${classAttr} ${catAttr}>${choice.text}</a>`;
+      }).join('\n') + '\n</div>\n';
+    }
+
+    if (pageConfig.formInputs && pageConfig.formInputs.length > 0) {
+      interactiveHtml += '\n<div class="form-inputs">\n' + pageConfig.formInputs.map((inp) => {
+        const idAttr = inp.selector.startsWith('#') ? `id="${inp.selector.slice(1)}"` : '';
+        const classAttr = inp.selector.startsWith('.') ? `class="${inp.selector.slice(1)}"` : '';
+        const nameAttr = inp.name ? `name="${inp.name}"` : '';
+        const typeAttr = `type="${inp.type || 'text'}"`;
+        const phAttr = inp.placeholder ? `placeholder="${inp.placeholder}"` : '';
+        const ariaAttr = inp.ariaLabel ? `aria-label="${inp.ariaLabel}"` : '';
+        const valAttr = inp.value ? `value="${inp.value}"` : '';
+        if (inp.tag === 'textarea') {
+          return `<textarea ${idAttr} ${classAttr} ${nameAttr} ${phAttr} ${ariaAttr}>${inp.value || ''}</textarea>`;
+        }
+        return `<input ${typeAttr} ${idAttr} ${classAttr} ${nameAttr} ${phAttr} ${ariaAttr} ${valAttr} />`;
+      }).join('\n') + '\n</div>\n';
+    }
+
+    if (pageConfig.forms && pageConfig.forms.length > 0) {
+      interactiveHtml += '\n' + pageConfig.forms.map((f) => {
+        const formId = f.id ? `id="${f.id}"` : (f.selector?.startsWith('#') ? `id="${f.selector.slice(1)}"` : '');
+        const formClass = f.selector?.startsWith('.') ? `class="${f.selector.slice(1)}"` : '';
+        const actionAttr = f.action ? `action="${f.action}"` : 'action="/submit"';
+        const methodAttr = `method="${f.method || 'POST'}"`;
+        const fieldsHtml = f.fields.map((field) => {
+          const fId = field.id ? `id="${field.id}"` : (field.selector?.startsWith('#') ? `id="${field.selector.slice(1)}"` : '');
+          const fClass = field.selector?.startsWith('.') ? `class="${field.selector.slice(1)}"` : '';
+          const fName = field.name ? `name="${field.name}"` : '';
+          const fPh = field.placeholder ? `placeholder="${field.placeholder}"` : '';
+          const fVal = field.value ? `value="${field.value}"` : '';
+          const fDis = field.disabled ? 'disabled' : '';
+          if (field.tag === 'textarea') {
+            return `<textarea ${fId} ${fClass} ${fName} ${fPh} ${fDis}>${field.value || ''}</textarea>`;
+          }
+          if (field.tag === 'select') {
+            const opts = (field.options || []).map((o) => `<option value="${o.value}">${o.label}</option>`).join('');
+            return `<select ${fId} ${fClass} ${fName} ${fDis}>${opts}</select>`;
+          }
+          return `<input type="${field.type || 'text'}" ${fId} ${fClass} ${fName} ${fPh} ${fVal} ${fDis} />`;
+        }).join('\n');
+        const submitBtn = f.submitButton ? `<button type="submit" ${f.submitButton.id ? `id="${f.submitButton.id}"` : ''} class="${f.submitButton.selector?.replace(/^[.#]/, '') || 'btn-submit'}">${f.submitButton.text || 'Submit'}</button>` : '<button type="submit">Submit</button>';
+        return `<form ${formId} ${formClass} ${actionAttr} ${methodAttr}>\n${fieldsHtml}\n${submitBtn}\n</form>`;
       }).join('\n');
     }
 
@@ -2170,4 +2849,401 @@ export function applySteeringInstruction(
     updatedParams: updated,
   };
 }
+
+// ===========================================================================
+// Browser Agent Collaborative Browsing, Checkpointing & UI Workflow Helpers
+// ===========================================================================
+
+function extractAttr(attrs: string, name: string): string | undefined {
+  const match = attrs.match(new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
+  if (!match) return undefined;
+  return match[1] ?? match[2] ?? match[3];
+}
+
+/**
+ * Lightweight DOM scanner extracting interactive form inputs from HTML.
+ * Filters out hidden, disabled, and non-interactive inputs.
+ * Truncates candidate list to top 15 most relevant elements per Boundary B4.2.
+ */
+export function detectInteractiveFormInputs(html: string): InteractiveInputElement[] {
+  const inputs: InteractiveInputElement[] = [];
+
+  // Match input, textarea, select tags
+  const tagRegex = /<(input|textarea|select)\b([^>]*)>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = tagRegex.exec(html)) !== null) {
+    const tag = match[1].toLowerCase();
+    const attrs = match[2];
+
+    // Check if disabled or type="hidden"
+    if (/\bdisabled\b/i.test(attrs)) continue;
+
+    const type = extractAttr(attrs, 'type')?.toLowerCase() || (tag === 'textarea' ? 'textarea' : 'text');
+    if (type === 'hidden') continue;
+
+    const id = extractAttr(attrs, 'id');
+    const className = extractAttr(attrs, 'class');
+    const name = extractAttr(attrs, 'name');
+    const placeholder = extractAttr(attrs, 'placeholder');
+    const ariaLabel = extractAttr(attrs, 'aria-label');
+    const value = extractAttr(attrs, 'value') || '';
+
+    let selector = '';
+    if (id) {
+      selector = `#${id}`;
+    } else if (name) {
+      selector = `${tag}[name="${name}"]`;
+    } else if (className) {
+      selector = `.${className.trim().split(/\s+/)[0]}`;
+    } else {
+      selector = `${tag}:nth-of-type(${inputs.length + 1})`;
+    }
+
+    inputs.push({
+      selector,
+      tag,
+      type,
+      name,
+      placeholder,
+      ariaLabel,
+      value,
+    });
+  }
+
+  // Boundary B4.2: Truncate candidate list to top 15 most relevant elements
+  return inputs.slice(0, 15);
+}
+
+/**
+ * Lightweight DOM scanner extracting navigation choices from HTML.
+ */
+export function detectNavigationForks(html: string): NavigationChoice[] {
+  const choices: NavigationChoice[] = [];
+  const linkRegex = /<a\b([^>]*)>(.*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = linkRegex.exec(html)) !== null) {
+    const attrs = match[1];
+    const text = match[2].replace(/<[^>]+>/g, '').trim();
+
+    const href = extractAttr(attrs, 'href');
+    const id = extractAttr(attrs, 'id');
+    const className = extractAttr(attrs, 'class');
+    const category = extractAttr(attrs, 'data-category');
+
+    let selector = '';
+    if (id) {
+      selector = `#${id}`;
+    } else if (className) {
+      selector = `.${className.trim().split(/\s+/)[0]}`;
+    } else if (href) {
+      selector = `a[href="${href}"]`;
+    } else {
+      selector = `a:nth-of-type(${choices.length + 1})`;
+    }
+
+    choices.push({
+      selector,
+      text: text || 'Link',
+      href,
+      category,
+    });
+  }
+
+  return choices;
+}
+
+/**
+ * System 2 Goal-Conditioned Deliberation simulator.
+ * Deliberates on HandoverContext and user goal, producing a SystemTwoSteeringAction.
+ */
+export async function deliberateCollaborativeStep(
+  context: HandoverContext,
+  modelOnline = true
+): Promise<SystemTwoSteeringAction> {
+  // If model service is offline, execute deterministic fallback per F5.5 / B5.4
+  if (!modelOnline) {
+    if (context.navigationChoices && context.navigationChoices.length > 0) {
+      const choice = context.navigationChoices[0];
+      return {
+        action: 'choose_navigation',
+        selector: choice.selector,
+        url: choice.href,
+        text: choice.text,
+        reasoning: 'Fallback heuristic: offline System 2 selected first navigation candidate',
+      };
+    }
+    if (context.formInputs && context.formInputs.length > 0) {
+      const inp = context.formInputs[0];
+      return {
+        action: 'form_input',
+        selector: inp.selector,
+        text: 'test query',
+        submitSelector: '#search-btn',
+        pressEnter: true,
+        reasoning: 'Fallback heuristic: offline System 2 selected default input query',
+      };
+    }
+    return {
+      action: 'paginate',
+      selector: '#next-page',
+      text: 'Next Page',
+    };
+  }
+
+  const goalLower = (context.userGoal || '').toLowerCase();
+
+  // If trigger is form_input_required
+  if (context.triggerReason === 'form_input_required' || (context.formInputs && context.formInputs.length > 0 && !context.triggerReason)) {
+    if (!context.formInputs || context.formInputs.length === 0) {
+      return { action: 'adjust_strategy', scrollStepPx: 500 };
+    }
+
+    const input = context.formInputs[0];
+    let queryText = 'WebGPU ONNX acceleration';
+    if (goalLower.includes('release') || goalLower.includes('v0.2.0')) {
+      queryText = 'v0.2.0';
+    } else if (goalLower.includes('modernbert')) {
+      queryText = 'ModernBERT';
+    } else if (goalLower.includes('webgpu')) {
+      queryText = 'WebGPU ONNX';
+    } else if (goalLower.trim() === '') {
+      // Empty goal string fallback per B5.1
+      queryText = 'documentation overview';
+    } else {
+      // Extract key terms from goal
+      const words = goalLower.replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 3);
+      queryText = words.slice(0, 3).join(' ') || 'overview';
+    }
+
+    return {
+      action: 'form_input',
+      selector: input.selector,
+      text: queryText,
+      submitSelector: '#search-btn',
+      pressEnter: true,
+      reasoning: `Deliberated search query "${queryText}" based on user goal "${context.userGoal}"`,
+    };
+  }
+
+  // If trigger is navigation_fork
+  if (context.triggerReason === 'navigation_fork' || (context.navigationChoices && context.navigationChoices.length > 1)) {
+    const choices = context.navigationChoices || [];
+    if (choices.length === 0) {
+      return { action: 'adjust_strategy', scrollStepPx: 400 };
+    }
+
+    // Rank candidate branches based on goal relevance
+    let bestChoice = choices[0];
+    let maxScore = -1;
+
+    for (const c of choices) {
+      const text = `${c.text} ${c.href || ''} ${c.category || ''}`.toLowerCase();
+      let score = 0;
+      if (goalLower.includes('release') && (text.includes('release') || text.includes('v0.'))) score += 10;
+      if (goalLower.includes('tutorial') && (text.includes('tutorial') || text.includes('guide'))) score += 10;
+      if (goalLower.includes('doc') && text.includes('doc')) score += 5;
+      if (score > maxScore) {
+        maxScore = score;
+        bestChoice = c;
+      }
+    }
+
+    return {
+      action: 'choose_navigation',
+      selector: bestChoice.selector,
+      url: bestChoice.href,
+      text: bestChoice.text,
+      reasoning: `System 2 ranked branch "${bestChoice.text}" highest for goal "${context.userGoal}"`,
+    };
+  }
+
+  // Default / Stagnation
+  if (context.stuckReason === 'bottom_of_page') {
+    return {
+      action: 'paginate',
+      selector: '#next-page',
+      text: 'Next Page',
+    };
+  }
+
+  return {
+    action: 'adjust_strategy',
+    scrollStepPx: 500,
+  };
+}
+
+/**
+ * Loop guard preventing repetitive form submissions to the same selector.
+ */
+export class FormSubmissionLoopGuard {
+  private history: Array<{ selector: string; text: string; timestamp: number }> = [];
+
+  recordSubmission(selector: string, text: string): void {
+    this.history.push({ selector, text, timestamp: Date.now() });
+  }
+
+  getConsecutiveCount(selector: string, text: string): number {
+    let count = 0;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      if (this.history[i].selector === selector && this.history[i].text === text) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  shouldBlock(selector: string, text: string, threshold = 3): boolean {
+    return this.getConsecutiveCount(selector, text) >= threshold;
+  }
+
+  clear(): void {
+    this.history = [];
+  }
+}
+
+/**
+ * Loop guard preventing cyclical navigation between identical branches.
+ */
+export class ForkNavigationLoopGuard {
+  private visitedUrls = new Set<string>();
+
+  recordVisit(url: string): void {
+    this.visitedUrls.add(url);
+  }
+
+  isExhausted(url: string): boolean {
+    return this.visitedUrls.has(url);
+  }
+
+  canVisit(url: string): boolean {
+    return !this.visitedUrls.has(url);
+  }
+
+  clear(): void {
+    this.visitedUrls.clear();
+  }
+}
+
+/**
+ * Simulator for the 4-Page Desktop UI Workflow Store.
+ * Coordinates transitions, validation, and checkpoint state restoration.
+ */
+export class UiWizardStoreSimulator {
+  public currentPage: 1 | 2 | 3 | 4 = 1;
+  public canResume = false;
+  public userGoal = '';
+  public selectedModel = 'qwen2.5:3b';
+  public activeGgufModelId: string | null = null;
+  public taskSpec: CompiledTaskSpec | null = null;
+  public isTaskRunning = false;
+  public alertConfidenceThreshold = 0.85;
+  public actionTimeline: AgentAction[] = [];
+  public inferenceFeed: InferenceTelemetryItem[] = [];
+  public snapshot: BrowserSnapshot | null = null;
+  public results: ScrapedItem[] = [];
+  public chatMessages: Array<{ role: 'user' | 'assistant'; text: string; timestamp: number }> = [];
+  public lastCheckpoint: TaskCheckpoint | null = null;
+
+  setPage(page: number): void {
+    this.currentPage = Math.max(1, Math.min(4, Math.floor(page))) as 1 | 2 | 3 | 4;
+  }
+
+  nextPage(): void {
+    this.setPage(this.currentPage + 1);
+  }
+
+  prevPage(): void {
+    this.setPage(this.currentPage - 1);
+  }
+
+  setUserGoal(goal: string): void {
+    this.userGoal = goal;
+  }
+
+  canAdvanceFromPage1(): boolean {
+    return this.userGoal.trim().length > 0;
+  }
+
+  compileSpec(goal?: string): CompiledTaskSpec {
+    const targetGoal = goal || this.userGoal || 'Default Browsing Goal';
+    const spec: CompiledTaskSpec = {
+      id: `task-${Date.now()}`,
+      name: `Agent Run: ${targetGoal.slice(0, 20)}`,
+      userGoal: targetGoal,
+      targetUrl: 'http://127.0.0.1:8080/docs',
+      domSelector: '.doc-card',
+      pollIntervalMs: 500,
+      scrollStepPx: 400,
+      questions: {
+        relevant: { type: 'noul', statement: 'Is this item relevant to user goal?' },
+      },
+      alertRule: {
+        questionKey: 'relevant',
+        operator: 'gte',
+        targetValue: 0.8,
+        minAnswerConfidence: this.alertConfidenceThreshold,
+      },
+      createdAt: Date.now(),
+    };
+    this.taskSpec = spec;
+    return spec;
+  }
+
+  setThreshold(val: number): void {
+    this.alertConfidenceThreshold = Math.max(0.50, Math.min(0.99, val));
+    if (this.taskSpec) {
+      this.taskSpec.alertRule.minAnswerConfidence = this.alertConfidenceThreshold;
+    }
+  }
+
+  startTask(): boolean {
+    if (!this.taskSpec) {
+      this.compileSpec();
+    }
+    this.isTaskRunning = true;
+    this.currentPage = 3;
+    return true;
+  }
+
+  stopTask(): void {
+    this.isTaskRunning = false;
+  }
+
+  applyCheckpoint(checkpoint: TaskCheckpoint): void {
+    this.lastCheckpoint = checkpoint;
+    this.canResume = true;
+    if (checkpoint.wizardState?.userGoal) {
+      this.userGoal = checkpoint.wizardState.userGoal;
+    }
+    if (checkpoint.wizardState?.currentPage) {
+      this.setPage(checkpoint.wizardState.currentPage);
+    }
+    if (checkpoint.chatContext) {
+      this.chatMessages = checkpoint.chatContext.map((c) => ({
+        role: c.role as 'user' | 'assistant',
+        text: c.text,
+        timestamp: c.timestamp,
+      }));
+    }
+  }
+
+  reset(): void {
+    this.currentPage = 1;
+    this.canResume = false;
+    this.userGoal = '';
+    this.taskSpec = null;
+    this.isTaskRunning = false;
+    this.lastCheckpoint = null;
+    this.actionTimeline = [];
+    this.inferenceFeed = [];
+    this.snapshot = null;
+    this.results = [];
+    this.chatMessages = [];
+  }
+}
+
 

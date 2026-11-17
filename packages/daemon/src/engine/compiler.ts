@@ -6,6 +6,7 @@ import type {
   LayaQuestionMap,
   AlertRule
 } from '@ofln-scout/shared';
+import { llamaEngine, GGUF_CATALOG } from './llamaEngine.js';
 
 /**
  * Standard CSS selector presets for popular websites and generic web articles.
@@ -177,36 +178,87 @@ export async function getSystemTwoModelStats(
   gpuOffloaded?: boolean;
   error?: string;
 }> {
-  const [tagsRes, psRes] = await Promise.all([
-    fetchOllamaModels(baseUrl),
-    fetchOllamaPs(baseUrl)
-  ]);
+  // 1. If baseUrl is explicitly specified (e.g. in test harness or remote Ollama), check that endpoint directly
+  if (baseUrl) {
+    const [tagsRes, psRes] = await Promise.all([
+      fetchOllamaModels(baseUrl),
+      fetchOllamaPs(baseUrl)
+    ]);
 
-  const isOnline = tagsRes.online || psRes.online;
-  const availableModels = tagsRes.models.length > 0 ? tagsRes.models : [...DEFAULT_OLLAMA_MODELS];
+    const isOnline = tagsRes.online || psRes.online;
+    const availableModels = tagsRes.models.length > 0 ? tagsRes.models : [...DEFAULT_OLLAMA_MODELS];
 
-  if (!isOnline) {
+    if (!isOnline) {
+      return {
+        modelName: selectedModel,
+        availableModels,
+        status: 'idle',
+        vramUsageMb: 0,
+        gpuOffloaded: false,
+        error: 'Ollama daemon offline (offline template fallback active)'
+      };
+    }
+
+    const active = psRes.models.find(
+      (m) => m.name === selectedModel || m.model === selectedModel || m.name.startsWith(selectedModel)
+    ) || psRes.models[0];
+
     return {
-      modelName: selectedModel,
+      modelName: active ? active.name : selectedModel,
       availableModels,
-      status: 'idle',
-      vramUsageMb: 0,
-      gpuOffloaded: false,
-      error: 'Ollama daemon offline (offline template fallback active)'
+      status: 'ready',
+      vramUsageMb: active ? active.vramUsageMb : psRes.totalVramUsageMb,
+      gpuOffloaded: active ? active.gpuOffloaded : psRes.gpuOffloaded
     };
   }
 
-  const active = psRes.models.find(
-    (m) => m.name === selectedModel || m.model === selectedModel || m.name.startsWith(selectedModel)
-  ) || psRes.models[0];
+  // 2. Check embedded llamaEngine (hardware-accelerated via Vulkan/CUDA/DirectML)
+  try {
+    const telemetry = await llamaEngine.getTelemetry();
+    const ggufList = llamaEngine.getModelsList();
+    const availableModels = ggufList.map((m) => m.id);
 
-  return {
-    modelName: active ? active.name : selectedModel,
-    availableModels,
-    status: 'ready',
-    vramUsageMb: active ? active.vramUsageMb : psRes.totalVramUsageMb,
-    gpuOffloaded: active ? active.gpuOffloaded : psRes.gpuOffloaded
-  };
+    if (llamaEngine.isReady()) {
+      return {
+        modelName: llamaEngine.getActiveModelId() || selectedModel,
+        availableModels,
+        status: 'ready',
+        vramUsageMb: telemetry.vramUsageMb,
+        gpuOffloaded: telemetry.gpuOffloaded
+      };
+    }
+
+    const downloaded = ggufList.filter((m) => m.downloaded);
+    if (downloaded.length > 0) {
+      return {
+        modelName: downloaded[0].id,
+        availableModels,
+        status: 'idle',
+        vramUsageMb: telemetry.vramUsageMb,
+        gpuOffloaded: telemetry.gpuOffloaded,
+        error: `Downloaded models available on disk: ${downloaded.map((m) => m.name).join(', ')} (activate to load onto ${telemetry.gpuName})`
+      };
+    }
+
+    return {
+      modelName: selectedModel,
+      availableModels: availableModels.length > 0 ? availableModels : GGUF_CATALOG.map((m) => m.id),
+      status: 'idle',
+      vramUsageMb: telemetry.vramUsageMb,
+      gpuOffloaded: telemetry.gpuOffloaded,
+      error: `Embedded llama.cpp active on ${telemetry.gpuName} (${telemetry.gpuBackend}). Download a model below to run on GPU.`
+    };
+  } catch {
+    // Fallback if llamaEngine cannot initialize
+    return {
+      modelName: selectedModel,
+      availableModels: GGUF_CATALOG.map((m) => m.id),
+      status: 'idle',
+      vramUsageMb: 0,
+      gpuOffloaded: false,
+      error: 'Offline template fallback active'
+    };
+  }
 }
 
 /**
@@ -654,6 +706,30 @@ Rules:
 4. All text instructions must be concise (< 160 tokens).
 Return ONLY the JSON object.`;
 
+  // 1. Try embedded llama.cpp engine if loaded on GPU
+  if (llamaEngine.isReady()) {
+    try {
+      const responseText = await llamaEngine.generateText(
+        `User Goal: "${userGoal}"\n\nReturn ONLY the valid JSON specification matching the schema:`,
+        { systemPrompt }
+      );
+      if (responseText) {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          parsed.userGoal = userGoal;
+          const sanitized = sanitizeCompiledSpec(parsed);
+          if (sanitized.valid && sanitized.sanitizedSpec) {
+            return sanitized.sanitizedSpec;
+          }
+        }
+      }
+    } catch {
+      // continue to Ollama / offline template fallback
+    }
+  }
+
+  // 2. Query Ollama if available
   for (const currentModel of modelsToTry) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);

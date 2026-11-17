@@ -6,16 +6,38 @@ import type {
   AgentAction,
   BrowserSnapshot,
   SystemPerformanceMetrics,
+  ScrapedItem,
+  ResultStats,
+  ModelStats,
+  GgufModelInfo,
+  TaskCheckpoint,
 } from '@ofln-scout/shared';
+import { wsClient } from '../lib/wsClient';
 
 export interface DaemonStatus {
   isRunning: boolean;
   layaReady: boolean;
   activeTaskId: string | null;
+  activeRunId?: string | null;
+  lastCheckpoint?: TaskCheckpoint;
 }
 
 export type CompilationStatus = 'idle' | 'compiling' | 'ready' | 'error';
-export type AppTab = 'workbench' | 'jobs' | 'status';
+export type AppTab = 'workbench' | 'jobs' | 'status' | 'results';
+export type WorkflowPage = 1 | 2 | 3 | 4;
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  type: 'query' | 'steer';
+  content: string;
+  timestamp: number;
+  meta?: {
+    model?: string;
+    applied?: boolean;
+    explanation?: string;
+  };
+}
 
 export interface LatencyPoint {
   time: string;
@@ -33,6 +55,16 @@ export interface ScoutState {
   // Navigation
   activeTab: AppTab;
   setActiveTab: (tab: AppTab) => void;
+  currentPage: WorkflowPage;
+  setPage: (page: WorkflowPage | number) => void;
+  nextPage: () => void;
+  prevPage: () => void;
+
+  // Checkpointing & Resumption
+  lastCheckpoint?: TaskCheckpoint;
+  canResume: boolean;
+  setLastCheckpoint: (chk: TaskCheckpoint) => void;
+  resumeTask: (taskId?: string, checkpointId?: string) => Promise<void>;
 
   // Connection & Daemon Status
   wsConnected: boolean;
@@ -43,10 +75,16 @@ export interface ScoutState {
   compilationMessage: string;
   currentSpec: CompiledTaskSpec | null;
 
-  // Models (System 2 Ollama)
+  // Models (System 2 Ollama & Llama.cpp)
   selectedModel: string;
   availableModels: string[];
   ollamaOnline: boolean;
+  ggufModels: GgufModelInfo[];
+  activeGgufModelId: string | null;
+  gpuName: string;
+  gpuBackend: string;
+  vramUsageMb: number;
+  totalVramMb: number;
 
   // Real-time Feeds
   inferenceFeed: InferenceTelemetryItem[];
@@ -63,6 +101,20 @@ export interface ScoutState {
   metrics: SystemPerformanceMetrics | null;
   metricsHistory: SystemPerformanceMetrics[];
 
+  // Results & Reporting
+  resultsMarkdown: string;
+  resultsSummary: string;
+  resultsStats: ResultStats | null;
+  resultsItems: ScrapedItem[];
+  resultsLastUpdated: number | null;
+
+  // System 2 Chat & Steering
+  chatMessages: ChatMessage[];
+  isChatLoading: boolean;
+
+  // Dual-Brain Model Telemetry
+  modelStats: ModelStats | null;
+
   // Actions
   setConnected: (connected: boolean) => void;
   setStatus: (status: DaemonStatus) => void;
@@ -76,6 +128,23 @@ export interface ScoutState {
   setSpec: (spec: CompiledTaskSpec | null) => void;
   setSelectedModel: (model: string) => void;
   setModelsList: (models: string[], selectedModel?: string, ollamaOnline?: boolean) => void;
+  setGgufModelsList: (payload: {
+    models: GgufModelInfo[];
+    activeModelId: string | null;
+    gpuName: string;
+    gpuBackend: string;
+    vramUsageMb: number;
+    totalVramMb: number;
+  }) => void;
+  updateModelDownloadProgress: (payload: {
+    modelId: string;
+    percent: number;
+    downloadedMb: number;
+    totalMb: number;
+    speedMbps: number;
+    status: 'downloading' | 'completed' | 'error' | 'cancelled';
+    error?: string;
+  }) => void;
   addInference: (item: InferenceTelemetryItem) => void;
   addAlert: (item: InferenceTelemetryItem) => void;
   clearAlerts: () => void;
@@ -86,6 +155,17 @@ export interface ScoutState {
   updateJobStatus: (jobId: string, status: string, activeRunId?: string) => void;
   setActiveJobId: (id: string | null) => void;
   setMetrics: (metrics: SystemPerformanceMetrics) => void;
+  setResults: (payload: {
+    markdown?: string;
+    summary?: string;
+    stats?: ResultStats;
+    items?: ScrapedItem[];
+    timestamp?: string | number;
+  }) => void;
+  addChatMessage: (msg: ChatMessage) => void;
+  clearChatMessages: () => void;
+  setChatLoading: (loading: boolean) => void;
+  setModelStats: (stats: ModelStats) => void;
   startFreshRun: () => void;
   reset: () => void;
 }
@@ -126,6 +206,32 @@ export const useScoutStore = create<ScoutState>((set) => ({
   activeTab: 'workbench',
   setActiveTab: (activeTab: AppTab) => set({ activeTab }),
 
+  currentPage: 1,
+  setPage: (page: WorkflowPage | number) =>
+    set(() => ({
+      currentPage: Math.max(1, Math.min(4, Math.floor(page))) as WorkflowPage,
+    })),
+  nextPage: () =>
+    set((state) => ({
+      currentPage: Math.min(4, state.currentPage + 1) as WorkflowPage,
+    })),
+  prevPage: () =>
+    set((state) => ({
+      currentPage: Math.max(1, state.currentPage - 1) as WorkflowPage,
+    })),
+
+  lastCheckpoint: undefined,
+  canResume: false,
+  setLastCheckpoint: (lastCheckpoint: TaskCheckpoint) =>
+    set((state) => ({
+      lastCheckpoint,
+      canResume: !state.daemonStatus.isRunning,
+    })),
+  resumeTask: async (taskId?: string, checkpointId?: string) => {
+    wsClient.resumeTask(taskId, checkpointId);
+    set({ currentPage: 3 });
+  },
+
   wsConnected: false,
   daemonStatus: initialDaemonStatus,
   isLaunching: false,
@@ -134,9 +240,15 @@ export const useScoutStore = create<ScoutState>((set) => ({
   compilationMessage: 'Ready to compile task goal',
   currentSpec: null,
 
-  selectedModel: 'qwen2.5:7b-instruct-q4_K_M',
+  selectedModel: 'qwen2.5:1.5b',
   availableModels: DEFAULT_MODELS,
   ollamaOnline: true,
+  ggufModels: [],
+  activeGgufModelId: null,
+  gpuName: 'Detecting GPU...',
+  gpuBackend: 'vulkan',
+  vramUsageMb: 0,
+  totalVramMb: 0,
 
   inferenceFeed: [],
   alerts: [],
@@ -150,6 +262,17 @@ export const useScoutStore = create<ScoutState>((set) => ({
   metrics: null,
   metricsHistory: [],
 
+  resultsMarkdown: '',
+  resultsSummary: '',
+  resultsStats: null,
+  resultsItems: [],
+  resultsLastUpdated: null,
+
+  chatMessages: [],
+  isChatLoading: false,
+
+  modelStats: null,
+
   setConnected: (connected: boolean) =>
     set((state) => {
       if (!connected) {
@@ -158,6 +281,7 @@ export const useScoutStore = create<ScoutState>((set) => ({
           wsConnected: false,
           isLaunching: false,
           isStopping: false,
+          isChatLoading: false,
           telemetryStats: {
             ...state.telemetryStats,
             avgLatencyMs: 0,
@@ -168,11 +292,19 @@ export const useScoutStore = create<ScoutState>((set) => ({
     }),
 
   setStatus: (daemonStatus: DaemonStatus) =>
-    set((state) => ({
-      daemonStatus,
-      isLaunching: daemonStatus.isRunning ? false : state.isLaunching,
-      isStopping: !daemonStatus.isRunning ? false : state.isStopping,
-    })),
+    set((state) => {
+      const lastCheckpoint = daemonStatus.lastCheckpoint !== undefined
+        ? daemonStatus.lastCheckpoint
+        : state.lastCheckpoint;
+      const canResume = !!(lastCheckpoint && !daemonStatus.isRunning);
+      return {
+        daemonStatus,
+        lastCheckpoint,
+        canResume,
+        isLaunching: daemonStatus.isRunning ? false : state.isLaunching,
+        isStopping: !daemonStatus.isRunning ? false : state.isStopping,
+      };
+    }),
 
   setIsLaunching: (isLaunching: boolean) => set({ isLaunching }),
   setIsStopping: (isStopping: boolean) => set({ isStopping }),
@@ -211,6 +343,38 @@ export const useScoutStore = create<ScoutState>((set) => ({
         selectedModel: selectedModel || state.selectedModel,
         ollamaOnline: ollamaOnline !== undefined ? ollamaOnline : state.ollamaOnline,
       };
+    }),
+
+  setGgufModelsList: (payload) =>
+    set(() => ({
+      ggufModels: payload.models,
+      activeGgufModelId: payload.activeModelId,
+      gpuName: payload.gpuName,
+      gpuBackend: payload.gpuBackend,
+      vramUsageMb: payload.vramUsageMb,
+      totalVramMb: payload.totalVramMb,
+      ollamaOnline: payload.activeModelId !== null
+    })),
+
+  updateModelDownloadProgress: (payload) =>
+    set((state) => {
+      const updated = state.ggufModels.map((m) => {
+        if (m.id !== payload.modelId) return m;
+        return {
+          ...m,
+          downloaded: payload.status === 'completed' ? true : m.downloaded,
+          isDownloading: payload.status === 'downloading',
+          downloadProgress: payload.status === 'downloading'
+            ? {
+                percent: payload.percent,
+                downloadedMb: payload.downloadedMb,
+                totalMb: payload.totalMb,
+                speedMbps: payload.speedMbps
+              }
+            : undefined
+        };
+      });
+      return { ggufModels: updated };
     }),
 
   addInference: (item: InferenceTelemetryItem) =>
@@ -317,6 +481,32 @@ export const useScoutStore = create<ScoutState>((set) => ({
       metricsHistory: [...state.metricsHistory, metrics].slice(-MAX_METRICS_HISTORY),
     })),
 
+  setResults: (payload) =>
+    set((state) => ({
+      resultsMarkdown: payload.markdown !== undefined ? payload.markdown : state.resultsMarkdown,
+      resultsSummary: payload.summary !== undefined ? payload.summary : state.resultsSummary,
+      resultsStats: payload.stats !== undefined ? payload.stats : state.resultsStats,
+      resultsItems: payload.items !== undefined ? payload.items : state.resultsItems,
+      resultsLastUpdated:
+        payload.timestamp !== undefined
+          ? (typeof payload.timestamp === 'string' ? new Date(payload.timestamp).getTime() : payload.timestamp)
+          : Date.now(),
+    })),
+
+  addChatMessage: (msg: ChatMessage) =>
+    set((state) => ({
+      chatMessages: [...state.chatMessages, msg],
+    })),
+
+  clearChatMessages: () =>
+    set({ chatMessages: [] }),
+
+  setChatLoading: (isChatLoading: boolean) =>
+    set({ isChatLoading }),
+
+  setModelStats: (modelStats: ModelStats) =>
+    set({ modelStats }),
+
   startFreshRun: () =>
     set({
       inferenceFeed: [],
@@ -326,11 +516,21 @@ export const useScoutStore = create<ScoutState>((set) => ({
       latestSnapshot: null,
       isLaunching: false,
       isStopping: false,
+      resultsMarkdown: '',
+      resultsSummary: '',
+      resultsStats: null,
+      resultsItems: [],
+      resultsLastUpdated: null,
+      chatMessages: [],
+      isChatLoading: false,
     }),
 
   reset: () =>
     set({
       activeTab: 'workbench',
+      currentPage: 1,
+      canResume: false,
+      lastCheckpoint: undefined,
       wsConnected: false,
       daemonStatus: initialDaemonStatus,
       isLaunching: false,
@@ -350,5 +550,13 @@ export const useScoutStore = create<ScoutState>((set) => ({
       activeJobId: null,
       metrics: null,
       metricsHistory: [],
+      resultsMarkdown: '',
+      resultsSummary: '',
+      resultsStats: null,
+      resultsItems: [],
+      resultsLastUpdated: null,
+      chatMessages: [],
+      isChatLoading: false,
+      modelStats: null,
     }),
 }));
